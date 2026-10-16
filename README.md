@@ -75,7 +75,7 @@ No data files are included in this repository. The scripts expect the input file
 
 Photoperiods: long day (LD) = 15L:9D, lights on 06:03; short day (SD) = 9L:15D, lights on 08:00. Each recording is 3 days of LD entrainment followed by 3 days of constant darkness (DD).
 
-**Excluded channels:** individuals that did not survive the 6-day recording were removed. Excluded channels are listed near the top of each script (`EXCLUSIONS`, `*_exclude_ch`, `EXCLUDE_PIP` / `EXCLUDE_QUIN`).
+**Excluded channels:** the channels removed from each analysis are listed near the top of each script (`EXCLUSIONS`, `*_exclude_ch`, `EXCLUDE_PIP` / `EXCLUDE_QUIN`), with comments giving the reason where one applies. Exclusions were set separately for each analysis, so the lists differ between scripts.
 
 **qPCR (Figs. 4–5):** one Excel file per gene, one row per sample, with columns `gene`, `species`, `photoperiod` (`SD`/`LD`), `zt`, `replicate` and `expr` (relative expression, 2^−ΔΔCt). Per-ZT means, SD and SE, together with all CircaCompare and ANOVA output, are in Table S1, sheet `Fig4_5_RTqPCR_CircaCompare`. Sample-level data are available from the corresponding author on request.
 
@@ -115,6 +115,8 @@ Analyses were run in R 4.3.1. Packages used:
 
 Periodograms were computed in Rtivity (Silva et al. 2022) and imported as Excel exports. PDF immunohistochemistry (Fig. 6) was quantified in FIJI/ImageJ.
 
+Record the package versions you used with `sessionInfo()`.
+
 ## Key references for the methods
 
 - Vaze KM et al. (2023). *J Comp Physiol A*: peak detection method adapted here.
@@ -132,4 +134,4 @@ Code is released under the MIT License (see `LICENSE`).
 
 ## Contact
 
-Corresponding author: Cheolho Sim, Department of Biology, Baylor University.
+Gavin Geddes, Department of Biology, Baylor University. Corresponding author: Cheolho Sim, Department of Biology, Baylor University.

@@ -75,8 +75,8 @@ output: html_document
 #   each photoperiod are then extracted for reporting and plotting.
 #
 #   M-peak phase is not analyzed as a separate outcome because
-#   M-peak detection was markedly lower in Cx. pipiens SD (58.6%)
-#   than in the other three groups (83.3-100%); a phase comparison
+#   M-peak detection was markedly lower in Cx. pipiens SD (55.2%)
+#   than in the other three groups (85.2-93.8%); a phase comparison
 #   would rest on a reduced, non-random subset of that group. E-peak
 #   detection showed no comparable group-specific loss.
 #

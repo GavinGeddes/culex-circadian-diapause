@@ -1,0 +1,251 @@
+---
+title: "Fig. 1 - Primary follicle length"
+author: "gavingeddes"
+date: "2026-03-22"
+output: html_document
+---
+```{r}
+# ============================================================
+# Mean follicle length per individual:
+# - reads already-averaged per-individual data from CSV
+# - plots Short day vs Long day
+# - species side-by-side within each photoperiod
+# - runs two-way ANOVA: Species * Photoperiod
+# - runs Tukey-adjusted post hoc comparisons
+# - adds Tukey letter groupings onto the figure
+# ============================================================
+
+# ---- 0. Install packages if needed ----
+packages <- c(
+  "dplyr", "ggplot2", "stringr",
+  "emmeans", "multcomp", "multcompView", "ragg"
+)
+to_install <- packages[!packages %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+# ---- 1. Load libraries ----
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(emmeans)
+library(multcomp)
+library(multcompView)
+library(ragg)
+
+# ---- 2. Read individual means CSV (already averaged per individual) ----
+indiv_means <- read.csv("Follicle_IndividualMeans.csv", stringsAsFactors = FALSE)
+
+# Set factor levels for consistent ordering/plotting
+indiv_means <- indiv_means %>%
+  mutate(
+    Species = factor(Species, levels = c("Cx. pipiens", "Cx. quinquefasciatus")),
+    Photoperiod = factor(Photoperiod, levels = c("9L:15D", "15L:9D"))
+  )
+
+cat("\n===== SAMPLE SIZES (individuals) =====\n")
+print(table(indiv_means$Photoperiod, indiv_means$Species))
+
+# ---- 3. Summary stats for reporting ----
+# Includes a count of individuals per group with a mean follicle length > 75 um
+summary_stats <- indiv_means %>%
+  group_by(Photoperiod, Species) %>%
+  summarise(
+    n_individuals = n(),
+    mean = mean(Mean_Follicle_Length, na.rm = TRUE),
+    sd = sd(Mean_Follicle_Length, na.rm = TRUE),
+    sem = sd / sqrt(n_individuals),
+    median = median(Mean_Follicle_Length, na.rm = TRUE),
+    n_over_75um = sum(Mean_Follicle_Length > 75, na.rm = TRUE),
+    pct_over_75um = round(100 * n_over_75um / n_individuals, 1),
+    .groups = "drop"
+  )
+
+cat("\n===== SUMMARY STATISTICS =====\n")
+print(summary_stats)
+
+# ---- Export descriptive statistics ----
+write.csv(summary_stats, "Follicle_SummaryStats.csv", row.names = FALSE)
+
+# ---- 4. Two-way ANOVA ----
+anova_model <- aov(Mean_Follicle_Length ~ Species * Photoperiod, data = indiv_means)
+
+cat("\n===== TWO-WAY ANOVA =====\n")
+print(summary(anova_model))
+
+# ---- 5. Tukey-adjusted post hoc tests using estimated marginal means ----
+emm <- emmeans(anova_model, ~ Species * Photoperiod)
+
+cat("\n===== EMMEANS =====\n")
+print(emm)
+
+cat("\n===== TUKEY PAIRWISE COMPARISONS =====\n")
+tukey_pairs <- pairs(emm, adjust = "tukey")
+print(tukey_pairs)
+
+# Save pairwise comparisons table
+tukey_table <- as.data.frame(tukey_pairs)
+write.csv(tukey_table, "Tukey_pairwise_results.csv", row.names = FALSE)
+
+# ---- 6. Compact letter display for figure annotation ----
+# Groups sharing a letter are not significantly different
+cld_df <- cld(emm, adjust = "tukey", Letters = letters) %>%
+  as.data.frame()
+
+# Clean letter labels
+cld_df$.group <- gsub(" ", "", cld_df$.group)
+
+# Make sure factor levels match plotting data
+cld_df$Species <- factor(
+  cld_df$Species,
+  levels = levels(indiv_means$Species)
+)
+cld_df$Photoperiod <- factor(
+  cld_df$Photoperiod,
+  levels = levels(indiv_means$Photoperiod)
+)
+
+# Set y-position for letters above each box
+label_pos <- indiv_means %>%
+  group_by(Photoperiod, Species) %>%
+  summarise(
+    y = max(Mean_Follicle_Length, na.rm = TRUE) + 7,
+    .groups = "drop"
+  )
+
+cld_df <- left_join(cld_df, label_pos, by = c("Photoperiod", "Species"))
+
+cat("\n===== TUKEY LETTER GROUPS =====\n")
+print(cld_df[, c("Species", "Photoperiod", "emmean", ".group")])
+
+# ---- 6b. Build "n over 75 um / total n" ratio labels (like Fig. 2) ----
+# Placed just below the significance letters, above the boxes
+ratio_labels <- summary_stats %>%
+  mutate(
+    ratio_label = paste0("(", n_over_75um, "/", n_individuals, ")")
+  ) %>%
+  dplyr::select(Photoperiod, Species, ratio_label) %>%
+  left_join(
+    label_pos %>% mutate(y_ratio = y - 3.5) %>% dplyr::select(-y),
+    by = c("Photoperiod", "Species")
+  )
+
+# ---- 7. Plot ----
+p <- ggplot(
+  indiv_means,
+  aes(x = Photoperiod, y = Mean_Follicle_Length, fill = Species)
+) +
+  geom_boxplot(
+    position = position_dodge(width = 0.75),
+    width = 0.6,
+    outlier.shape = NA,
+    color = "black",
+    alpha = 1
+  ) +
+  geom_jitter(
+    position = position_jitterdodge(
+      jitter.width = 0.10,
+      dodge.width = 0.75
+    ),
+    size = 2,
+    alpha = 0.75,
+    color = "black"
+  ) +
+  geom_text(
+    data = cld_df,
+    aes(
+      x = Photoperiod,
+      y = y,
+      label = .group,
+      group = Species
+    ),
+    position = position_dodge(width = 0.75),
+    vjust = 0,
+    size = 5,
+    fontface = "bold",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = ratio_labels,
+    aes(
+      x = Photoperiod,
+      y = y_ratio,
+      label = ratio_label,
+      group = Species
+    ),
+    position = position_dodge(width = 0.75),
+    vjust = 0,
+    size = 3.2,
+    inherit.aes = FALSE
+  ) +
+  geom_hline(
+    yintercept = 75,
+    linetype = "dashed",
+    color = "gray70"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Cx. pipiens" = "white",
+      "Cx. quinquefasciatus" = "gray60"
+    ),
+    # Italic species names in the legend (order matches factor levels)
+    labels = c(
+      expression(italic("Cx. pipiens")),
+      expression(italic("Cx. quinquefasciatus"))
+    )
+  ) +
+  scale_x_discrete(
+    labels = c(
+      "9L:15D" = "Short day",
+      "15L:9D" = "Long day"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Primary follicle length (\u00b5m)"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(
+    ylim = c(
+      min(indiv_means$Mean_Follicle_Length, na.rm = TRUE) - 2,
+      max(cld_df$y, na.rm = TRUE) + 4
+    )
+  )
+
+print(p)
+
+# ---- 8. Save outputs ----
+# ragg device renders italic faces reliably across systems
+ggsave(
+  "Follicle_Boxplot_IndividualMeans_TwoWayANOVA_Tukey.png",
+  p,
+  device = ragg::agg_png,
+  width = 8,
+  height = 5,
+  dpi = 800
+)
+
+ggsave(
+  "Follicle_Boxplot_IndividualMeans_TwoWayANOVA_Tukey.pdf",
+  p,
+  width = 8,
+  height = 5
+)
+
+write.csv(summary_stats, "Follicle_SummaryStats.csv", row.names = FALSE)
+write.csv(cld_df, "Follicle_TukeyLetterGroups.csv", row.names = FALSE)
+
+cat("\nFiles saved:\n")
+cat(" - Follicle_Boxplot_IndividualMeans_TwoWayANOVA_Tukey.png\n")
+cat(" - Follicle_Boxplot_IndividualMeans_TwoWayANOVA_Tukey.pdf\n")
+cat(" - Follicle_SummaryStats.csv\n")
+cat(" - Follicle_TukeyLetterGroups.csv\n")
+cat(" - Tukey_pairwise_results.csv\n")
+```
+

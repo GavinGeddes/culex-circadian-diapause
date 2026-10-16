@@ -1,0 +1,1053 @@
+---
+title: "Fig. 2b-c - Activity during entrainment (LD)"
+author: "gavingeddes"
+date: "2026-07-24"
+output: html_document
+---
+```{r}
+# ============================================================
+# Locomotor activity analysis: Culex pipiens and
+# Culex quinquefasciatus under long-day (LD) and short-day (SD)
+# photoperiods
+#
+# Overview
+#   This script processes TriKinetics locomotor activity monitor
+#   recordings (one 32-channel monitor file per species x
+#   photoperiod), builds average 24 h activity profiles, and tests
+#   whether daily mean activity differs between species and
+#   photoperiods.
+#
+# Workflow
+#   1. Read each monitor file and keep the per-minute activity
+#      counts ("Ct" rows) for all 32 channels.
+#   2. Remove channels listed in EXCLUSIONS (see the settings
+#      section below).
+#   3. For each individual, average activity at each clock minute
+#      over the first DAYS_USE complete calendar days of recording
+#      (the window starts at the first midnight after recording
+#      begins, so a partial first day is skipped).
+#   4. Average these individual profiles to give a group profile
+#      (mean +/- SEM) and smooth it with a centered circular moving
+#      average (SMOOTH_WINDOW minutes, wrapping across midnight).
+#   5. Screen for outlying individuals: (a) single-minute activity
+#      above 5x the group median of individual maxima, and (b)
+#      whole-day mean activity outside 1.5 x IQR of the group.
+#      Flagged channels are reported; they are excluded only if
+#      added to EXCLUSIONS.
+#   6. Compute one daily mean activity value per individual and
+#      compare groups with a two-way species x photoperiod model
+#      (statistical approach below).
+#
+# Statistical approach (Step 10)
+#   - Fit a linear model (species x photoperiod) and test residual
+#     normality with the Shapiro-Wilk test (alpha = 0.05).
+#   - Normal residuals: Type II ANOVA (car::Anova) with pairwise
+#     contrasts from emmeans.
+#   - Non-normal residuals and strictly positive response: refit on
+#     the log scale; if those residuals are normal, use the
+#     log-scale Type II ANOVA and contrasts.
+#   - Otherwise: Aligned Rank Transform (ART) ANOVA with ART
+#     contrasts (ARTool package).
+#   - P-values are Holm-adjusted across all six pairwise
+#     comparisons among the four species x photoperiod groups; the
+#     two species-within-photoperiod comparisons are reported on
+#     the box plot.
+#
+# Input
+#   Four TriKinetics MonitorNN text files, named in CONDITIONS:
+#   pipiens_LD.txt, quinque_LD.txt, pipiens_SD.txt, quinque_SD.txt.
+#   Columns 2-3 hold the date and time, column 8 the data type
+#   ("Ct" = counts), and columns 11-42 the 32 activity channels.
+#
+# Output (written to the working directory)
+#   FigD_*_clockProfile_*.pdf/.png   24 h activity profile for each
+#                                    species x photoperiod, plus a
+#                                    combined four-panel figure
+#   FigE_dailyMeanActivity_boxplot_*.pdf/.png
+#                                    daily mean activity box plot
+#                                    with significance brackets
+#   activity_stats_full_results.txt  full statistical log
+#   activity_stats_full_results.csv  the same results as tables
+#
+# Requirements
+#   R with tidyverse, lubridate, readr, patchwork, car,
+#   emmeans, ARTool and ggsignif.
+#
+# References
+#   Wobbrock JO, Findlater L, Gergle D, Higgins JJ (2011). The
+#     aligned rank transform for nonparametric factorial analyses
+#     using only ANOVA procedures. Proc. ACM CHI 2011, 143-146.
+#   Elkin LA, Kay M, Higgins JJ, Wobbrock JO (2021). An aligned
+#     rank transform procedure for multifactor contrast tests.
+#     Proc. ACM UIST 2021, 754-768.
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+library(readr)
+library(patchwork)
+library(car)
+library(emmeans)
+library(ARTool)
+library(ggsignif)
+
+# Start from a clean workspace.
+rm(list = ls())
+
+# ============================================================
+# GLOBAL ANALYSIS SETTINGS
+# ============================================================
+DAYS_USE      <- 3     # number of complete calendar days analyzed per individual
+SMOOTH_WINDOW <- 11    # width (in 1-min bins) of the moving-average filter
+
+# ============================================================
+# PLOT COLORS (Cx. pipiens, Cx. quinquefasciatus)
+# ============================================================
+COL_PIP  <- "#3B82B8"
+COL_QUIN <- "#C65A1E"
+
+# ============================================================
+# SIGNIFICANCE LABELS (box plot)
+# Size of the bold significance labels (asterisks / "ns") drawn
+# above the brackets, in ggplot2 text-size units (size 5 is about
+# 14 pt).
+# ============================================================
+SIG_LABEL_SIZE <- 5
+
+# ============================================================
+# NUMBER OF CHANNELS PER MONITOR (before any exclusions)
+# ============================================================
+EXPECTED_N_TOTAL <- 32
+
+# ============================================================
+# PHOTOPERIOD CONDITIONS
+# Lights-on time (decimal hours), light-phase length (hours) and
+# input files for each photoperiod.
+#   LD = 15L:9D, lights on 06:03
+#   SD =  9L:15D, lights on 08:00
+# ============================================================
+CONDITIONS <- list(
+  LD = list(
+    lights_on_h = 6 + 3/60,     # 06:03
+    light_hours = 15,
+    pip_path    = "pipiens_LD.txt",
+    quin_path   = "quinque_LD.txt"
+  ),
+  SD = list(
+    lights_on_h = 8.0,
+    light_hours = 9,
+    pip_path    = "pipiens_SD.txt",
+    quin_path   = "quinque_SD.txt"
+  )
+)
+
+# ============================================================
+# CHANNEL EXCLUSIONS
+# Channel numbers (1-32) removed from each species x photoperiod
+# group before analysis; integer(0) means none are removed. The
+# expected number of individuals per group is computed from
+# EXPECTED_N_TOTAL minus the number of exclusions.
+# ============================================================
+EXCLUSIONS <- list(
+  LD = list(
+    pip  = c(8,15,16,26,27),
+    quin = c(2,6,10,17,19)
+  ),
+  SD = list(
+    # Channel 5: total activity 1655 vs. next highest 200 (8x the
+    # group median); flagged as an outlier by the diagnostic.
+    pip  = c(1,3,5,7,21),
+    quin = integer(0)
+  )
+)
+
+# ============================================================
+# READ A TRIKINETICS MONITOR FILE
+# Returns per-minute activity counts ("Ct" rows) for all channels
+# (file columns 11-42) in long format: datetime, id (ch1-ch32),
+# activity, species. Tab-delimited files are tried first, then
+# whitespace-delimited.
+# ============================================================
+read_lam_monitorNN_Ct_32ch <- function(path, species_label, expected_n = 32) {
+  df <- try(
+    readr::read_tsv(
+      path,
+      col_names = FALSE,
+      show_col_types = FALSE,
+      progress = FALSE
+    ),
+    silent = TRUE
+  )
+  if (inherits(df, "try-error") || ncol(df) < 42) {
+    df <- readr::read_table2(
+      path,
+      col_names = FALSE,
+      progress = FALSE
+    )
+  }
+  if (ncol(df) < 42) {
+    stop("File has ", ncol(df), " columns; expected at least 42. File: ", path)
+  }
+
+  datetime <- suppressWarnings(parse_date_time(
+    paste(df$X2, df$X3),
+    orders = c(
+      "d b y HMS",
+      "d b Y HMS",
+      "m/d/y HMS",
+      "m/d/Y HMS",
+      "Y-m-d HMS"
+    ),
+    tz = "UTC"
+  ))
+  if (sum(!is.na(datetime)) < 10) {
+    stop("Datetime parsing failed for: ", path)
+  }
+
+  df_ct <- df %>%
+    mutate(datetime = datetime) %>%
+    filter(as.character(X8) == "Ct")
+  if (nrow(df_ct) == 0) {
+    stop("No 'Ct' rows detected in column 8 for: ", path)
+  }
+
+  tube_cols <- paste0("X", 11:42)
+  out <- df_ct %>%
+    select(datetime, all_of(tube_cols)) %>%
+    mutate(across(-datetime, ~ suppressWarnings(as.numeric(.x)))) %>%
+    rename_with(~ paste0("ch", seq_len(expected_n)), -datetime) %>%
+    pivot_longer(-datetime, names_to = "id", values_to = "activity") %>%
+    mutate(species = species_label) %>%
+    filter(!is.na(datetime))
+
+  n_ids <- n_distinct(out$id)
+  if (n_ids != expected_n) {
+    stop("Expected ", expected_n, " channels, but parsed ", n_ids, " in: ", path)
+  }
+
+  out
+}
+
+# ============================================================
+# OUTLIER DIAGNOSTIC (single-minute activity)
+# Within the analysis window, lists the highest single-minute
+# counts and a per-individual summary, and flags individuals whose
+# maximum single-minute count exceeds 5x the group median of
+# individual maxima. Flagged individuals are reported only.
+# ============================================================
+diagnose_outliers <- function(df_long, prof_obj, species_name,
+                               exclude_ids = character(),
+                               top_n_minutes = 20) {
+  one_min <- df_long %>%
+    mutate(min_time = round_date(datetime, unit = "minute")) %>%
+    group_by(id, min_time) %>%
+    summarise(activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
+  anchor   <- prof_obj$anchor
+  end_time <- prof_obj$end_time
+
+  df_window <- one_min %>%
+    filter(min_time >= anchor, min_time < end_time) %>%
+    filter(!id %in% exclude_ids) %>%
+    mutate(clock_h = (hour(min_time) * 60 + minute(min_time)) / 60)
+
+  cat("\n====================================\n")
+  cat("OUTLIER DIAGNOSTIC:", species_name, "\n")
+  cat("====================================\n")
+
+  cat("\nTop", top_n_minutes, "highest single-minute activity values:\n")
+  top_mins <- df_window %>%
+    arrange(desc(activity)) %>%
+    slice_head(n = top_n_minutes) %>%
+    select(id, min_time, clock_h, activity)
+  print(top_mins)
+
+  cat("\nPer-individual summary (sorted by max single-minute activity):\n")
+  per_ind_summ <- df_window %>%
+    group_by(id) %>%
+    summarise(
+      total_activity = sum(activity, na.rm = TRUE),
+      mean_activity  = mean(activity, na.rm = TRUE),
+      max_activity   = max(activity, na.rm = TRUE),
+      max_clock_h    = clock_h[which.max(activity)],
+      n_minutes      = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(max_activity))
+  print(per_ind_summ, n = Inf)
+
+  median_max <- median(per_ind_summ$max_activity, na.rm = TRUE)
+  threshold  <- 5 * median_max
+  flagged    <- per_ind_summ %>% filter(max_activity > threshold)
+
+  cat("\nMedian individual max activity:", round(median_max, 3), "\n")
+  cat("Flagging threshold (5x median max):", round(threshold, 3), "\n")
+
+  if (nrow(flagged) > 0) {
+    cat("\nFLAGGED individuals (likely outliers):\n")
+    print(flagged)
+  } else {
+    cat("\nNo individuals flagged at 5x threshold.\n")
+  }
+
+  invisible(list(
+    per_ind_summ = per_ind_summ,
+    flagged      = flagged,
+    threshold    = threshold
+  ))
+}
+
+# ============================================================
+# CIRCULAR MOVING-AVERAGE SMOOTHER
+# Centered moving average over a 24 h profile of evenly spaced
+# 1-min bins. The series wraps around midnight, so values near
+# 00:00 and 24:00 are smoothed with data from both ends of the day.
+# ============================================================
+circular_moving_average <- function(x, window = 11) {
+  if (window %% 2 == 0) stop("window must be odd for a centered moving average")
+  half <- (window - 1) / 2
+  n <- length(x)
+  if (n < window) stop("Series shorter than the smoothing window.")
+
+  x_padded <- c(utils::tail(x, half), x, utils::head(x, half))
+  smoothed <- stats::filter(x_padded, rep(1 / window, window), sides = 2)
+  as.numeric(smoothed[(half + 1):(half + n)])
+}
+
+# ============================================================
+# 24 H ACTIVITY PROFILE
+#   1) For each individual, average activity at each clock minute
+#      over the first `days_use` complete calendar days.
+#   2) Average the individual profiles to give the group mean and
+#      SEM at each clock minute.
+#   3) Smooth the group mean and SEM with a `smooth_window`-point
+#      circular moving average.
+# Returns the group profile ($summary), the individual profiles
+# ($per_ind), the number of individuals and the analysis window.
+# ============================================================
+make_clock_profile_first_full_days_midnight <- function(df_long,
+                                                        days_use = DAYS_USE,
+                                                        expected_n_indiv = 32,
+                                                        exclude_ids = character(),
+                                                        smooth_window = SMOOTH_WINDOW) {
+  if (length(exclude_ids) > 0) {
+    df_long <- df_long %>% filter(!id %in% exclude_ids)
+  }
+
+  one_min <- df_long %>%
+    mutate(min_time = round_date(datetime, unit = "minute")) %>%
+    group_by(id, min_time) %>%
+    summarise(activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
+  file_start <- min(one_min$min_time, na.rm = TRUE)
+  file_end   <- max(one_min$min_time, na.rm = TRUE)
+
+  # The analysis window starts at the first midnight at or after
+  # the start of recording, so a partial first day is skipped.
+  anchor   <- ceiling_date(file_start, unit = "day")
+  end_time <- anchor + days(days_use)
+
+  if (end_time > file_end) {
+    stop(
+      "Requested ", days_use, " full days but the recording only spans from ",
+      file_start, " to ", file_end, ". Reduce days_use or check the file."
+    )
+  }
+
+  df_window <- one_min %>%
+    filter(min_time >= anchor, min_time < end_time) %>%
+    mutate(
+      mod_min = hour(min_time) * 60L + minute(min_time),
+      clock_h = mod_min / 60
+    )
+
+  if (nrow(df_window) == 0) {
+    stop("No data in the midnight-anchored window. Check timestamps.")
+  }
+
+  n_indiv_window <- n_distinct(df_window$id)
+  if (n_indiv_window != expected_n_indiv) {
+    stop(
+      "Expected ", expected_n_indiv,
+      " individuals in the first ", days_use,
+      " full days, but found ", n_indiv_window, "."
+    )
+  }
+
+  # Step 1: each individual's mean activity at each clock minute,
+  # averaged across the `days_use` days in the window
+  per_ind <- df_window %>%
+    group_by(id, mod_min, clock_h) %>%
+    summarise(activity = mean(activity, na.rm = TRUE), .groups = "drop")
+
+  # Step 2: group mean and SEM across individuals
+  summ <- per_ind %>%
+    group_by(mod_min, clock_h) %>%
+    summarise(
+      mean_activity_raw = mean(activity, na.rm = TRUE),
+      sd_activity        = sd(activity, na.rm = TRUE),
+      n_indiv            = n_distinct(id),
+      sem_activity_raw    = sd_activity / sqrt(n_indiv),
+      .groups = "drop"
+    ) %>%
+    arrange(mod_min)
+
+  n_bins <- nrow(summ)
+  expected_bins <- 24 * 60
+  if (n_bins != expected_bins) {
+    warning(
+      "Expected ", expected_bins, " one-minute clock bins but found ", n_bins,
+      " - circular smoothing assumes an unbroken, evenly spaced 24h series. ",
+      "Check for missing minutes before trusting the smoothed profile."
+    )
+  }
+
+  # Step 3: smooth the group mean and SEM (circular, so there is no
+  # discontinuity at midnight)
+  summ <- summ %>%
+    mutate(
+      mean_activity = circular_moving_average(mean_activity_raw, window = smooth_window),
+      sem_activity  = circular_moving_average(sem_activity_raw, window = smooth_window)
+    )
+
+  message(
+    "Included channels: ",
+    paste(sort(unique(per_ind$id)), collapse = ", ")
+  )
+
+  list(
+    summary    = summ,
+    per_ind    = per_ind,
+    n_indiv    = n_distinct(per_ind$id),
+    anchor     = anchor,
+    file_start = file_start,
+    file_end   = file_end,
+    end_time   = end_time
+  )
+}
+
+# ============================================================
+# PLOT A 24 H ACTIVITY PROFILE
+# Smoothed group mean (line) +/- SEM (ribbon), with the dark
+# phase shaded grey. Unsmoothed values remain available in
+# $summary as mean_activity_raw and sem_activity_raw.
+# ============================================================
+plot_clock_profile_with_dark <- function(summ_df,
+                                         line_color,
+                                         lights_on,
+                                         lights_off,
+                                         y_limits = NULL) {
+  dark_df <- tibble(
+    xmin = c(0, lights_off),
+    xmax = c(lights_on, 24),
+    ymin = -Inf,
+    ymax = Inf
+  )
+
+  p <- ggplot(summ_df, aes(x = clock_h, y = mean_activity)) +
+    geom_rect(
+      data = dark_df,
+      aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+      inherit.aes = FALSE,
+      fill  = "grey85",
+      color = NA
+    ) +
+    geom_ribbon(
+      aes(
+        ymin = mean_activity - sem_activity,
+        ymax = mean_activity + sem_activity
+      ),
+      fill  = line_color,
+      alpha = 0.20
+    ) +
+    geom_line(color = line_color, linewidth = 1.1) +
+    scale_x_continuous(
+      limits = c(0, 24),
+      breaks = seq(0, 24, by = 3),
+      expand = c(0, 0)
+    ) +
+    labs(
+      x = "Time of day (h)",
+      y = "Mean activity (counts / min)"
+    ) +
+    theme_classic(base_size = 12)
+
+  if (!is.null(y_limits)) {
+    p <- p + coord_cartesian(ylim = y_limits)
+  }
+
+  p
+}
+
+# ============================================================
+# MAIN LOOP
+# For each photoperiod in CONDITIONS: read both species' files,
+# build profiles, run the outlier diagnostic, and plot and save
+# the activity profiles.
+# ============================================================
+results <- list()
+
+for (cond_name in names(CONDITIONS)) {
+  cond <- CONDITIONS[[cond_name]]
+  excl <- EXCLUSIONS[[cond_name]]
+  lights_off_h <- cond$lights_on_h + cond$light_hours
+
+  if (!file.exists(cond$pip_path))  stop("Cannot find file: ", cond$pip_path)
+  if (!file.exists(cond$quin_path)) stop("Cannot find file: ", cond$quin_path)
+
+  # Convert excluded channel numbers to channel ids ("ch5") and
+  # compute the expected number of individuals per group.
+  exclude_pip_ids  <- paste0("ch", excl$pip)
+  exclude_quin_ids <- paste0("ch", excl$quin)
+  expected_n_pip   <- EXPECTED_N_TOTAL - length(excl$pip)
+  expected_n_quin  <- EXPECTED_N_TOTAL - length(excl$quin)
+
+  cat("\n############################################################\n")
+  cat("# CONDITION:", cond_name, "\n")
+  cat("############################################################\n")
+
+  # ---- STEP 1: parse raw data ----
+  pip_long <- read_lam_monitorNN_Ct_32ch(
+    cond$pip_path, "Culex pipiens", expected_n = EXPECTED_N_TOTAL
+  )
+  quin_long <- read_lam_monitorNN_Ct_32ch(
+    cond$quin_path, "Culex quinquefasciatus", expected_n = EXPECTED_N_TOTAL
+  )
+
+  # ---- STEP 2: build 24 h profiles ----
+  pip_prof <- make_clock_profile_first_full_days_midnight(
+    pip_long,
+    days_use         = DAYS_USE,
+    expected_n_indiv = expected_n_pip,
+    exclude_ids      = exclude_pip_ids,
+    smooth_window    = SMOOTH_WINDOW
+  )
+  message(
+    cond_name, " PIP individuals used: ", pip_prof$n_indiv,
+    " | excluded: ", if (length(excl$pip) == 0) "none" else paste(exclude_pip_ids, collapse = ", "),
+    " | file start = ",       pip_prof$file_start,
+    " | midnight anchor = ",  pip_prof$anchor,
+    " | window end = ",       pip_prof$end_time
+  )
+
+  quin_prof <- make_clock_profile_first_full_days_midnight(
+    quin_long,
+    days_use         = DAYS_USE,
+    expected_n_indiv = expected_n_quin,
+    exclude_ids      = exclude_quin_ids,
+    smooth_window    = SMOOTH_WINDOW
+  )
+  message(
+    cond_name, " QUIN individuals used: ", quin_prof$n_indiv,
+    " | excluded: ", if (length(excl$quin) == 0) "none" else paste(exclude_quin_ids, collapse = ", "),
+    " | file start = ",        quin_prof$file_start,
+    " | midnight anchor = ",   quin_prof$anchor,
+    " | window end = ",        quin_prof$end_time
+  )
+
+  # ---- STEP 3: single-minute outlier diagnostic ----
+  # Results are printed to the console; channels are excluded only
+  # through EXCLUSIONS.
+  pip_diag  <- diagnose_outliers(
+    pip_long, pip_prof, paste0("Culex pipiens (", cond_name, ")"),
+    exclude_ids = exclude_pip_ids
+  )
+  quin_diag <- diagnose_outliers(
+    quin_long, quin_prof, paste0("Culex quinquefasciatus (", cond_name, ")"),
+    exclude_ids = exclude_quin_ids
+  )
+
+  # ---- STEP 4: common y-axis for both species within a photoperiod ----
+  global_y_max <- max(
+    pip_prof$summary$mean_activity  + pip_prof$summary$sem_activity,
+    quin_prof$summary$mean_activity + quin_prof$summary$sem_activity,
+    na.rm = TRUE
+  )
+  global_y_limits <- c(0, global_y_max * 1.05)
+
+  # ---- STEP 5: plot profiles ----
+  p_pip <- plot_clock_profile_with_dark(
+    pip_prof$summary, COL_PIP,
+    lights_on = cond$lights_on_h, lights_off = lights_off_h,
+    y_limits = global_y_limits
+  ) + ggtitle(
+    bquote(italic("Cx. pipiens") ~ .(cond_name) ~ "(n =" ~ .(pip_prof$n_indiv) ~ ")")
+  )
+
+  p_quin <- plot_clock_profile_with_dark(
+    quin_prof$summary, COL_QUIN,
+    lights_on = cond$lights_on_h, lights_off = lights_off_h,
+    y_limits = global_y_limits
+  ) + ggtitle(
+    bquote(italic("Cx. quinquefasciatus") ~ .(cond_name) ~ "(n =" ~ .(quin_prof$n_indiv) ~ ")")
+  )
+
+  # ---- STEP 6: save profiles ----
+  pip_stub  <- paste0("FigD_Cxpip_clockProfile_first3FULLdays_midnight_", cond_name, "_smoothed_excl")
+  quin_stub <- paste0("FigD_Cxquin_clockProfile_first3FULLdays_midnight_", cond_name, "_smoothed_excl")
+
+  ggsave(paste0(pip_stub, ".pdf"),  p_pip,  width = 7, height = 3.6)
+  ggsave(paste0(pip_stub, ".png"),  p_pip,  width = 7, height = 3.6, dpi = 600)
+  ggsave(paste0(quin_stub, ".pdf"), p_quin, width = 7, height = 3.6)
+  ggsave(paste0(quin_stub, ".png"), p_quin, width = 7, height = 3.6, dpi = 600)
+
+  # ---- STEP 7: display profiles ----
+  print(p_pip)
+  print(p_quin)
+
+  results[[cond_name]] <- list(
+    pip_prof = pip_prof, quin_prof = quin_prof,
+    pip_diag = pip_diag, quin_diag = quin_diag,
+    p_pip = p_pip, p_quin = p_quin
+  )
+}
+
+# ============================================================
+# STEP 8: COMBINED PROFILE FIGURE
+# Four-panel figure (patchwork): rows = photoperiod (LD, SD),
+# columns = species.
+# ============================================================
+combined_plot <-
+  (results$LD$p_pip | results$LD$p_quin) /
+  (results$SD$p_pip | results$SD$p_quin)
+
+print(combined_plot)
+
+ggsave(
+  "FigD_all_clockProfiles_first3FULLdays_midnight_smoothed_excl_combined.pdf",
+  combined_plot, width = 12, height = 7
+)
+ggsave(
+  "FigD_all_clockProfiles_first3FULLdays_midnight_smoothed_excl_combined.png",
+  combined_plot, width = 12, height = 7, dpi = 600
+)
+
+# ============================================================
+# STEP 9: DAILY MEAN ACTIVITY PER INDIVIDUAL
+# ============================================================
+# Each individual's 1440-minute profile (activity at each clock
+# minute averaged over DAYS_USE days; $per_ind) is smoothed with
+# the same circular moving average used for the group profiles
+# and then averaged over all 1440 minutes, giving one daily mean
+# activity value per individual. These values are used in the
+# statistical analysis.
+#
+# A circular moving average with weights summing to 1 preserves
+# the mean, so the smoothed and unsmoothed daily means are
+# identical; both are computed and their maximum difference is
+# printed as a check.
+# ============================================================
+subject_means <- bind_rows(lapply(names(results), function(cond_name) {
+  r <- results[[cond_name]]
+  bind_rows(
+    r$pip_prof$per_ind %>%
+      arrange(id, mod_min) %>%
+      group_by(id) %>%
+      summarise(
+        daily_mean_activity_raw      = mean(activity, na.rm = TRUE),
+        daily_mean_activity_smoothed = mean(circular_moving_average(activity, window = SMOOTH_WINDOW)),
+        .groups = "drop"
+      ) %>%
+      mutate(species = "pipiens", condition = cond_name),
+    r$quin_prof$per_ind %>%
+      arrange(id, mod_min) %>%
+      group_by(id) %>%
+      summarise(
+        daily_mean_activity_raw      = mean(activity, na.rm = TRUE),
+        daily_mean_activity_smoothed = mean(circular_moving_average(activity, window = SMOOTH_WINDOW)),
+        .groups = "drop"
+      ) %>%
+      mutate(species = "quinquefasciatus", condition = cond_name)
+  )
+}))
+subject_means$group <- paste(subject_means$species, subject_means$condition, sep = " / ")
+subject_means$group <- factor(
+  subject_means$group,
+  levels = c("pipiens / LD", "quinquefasciatus / LD", "pipiens / SD", "quinquefasciatus / SD")
+)
+
+cat("\n============================================================\n")
+cat("CHECK: smoothed vs unsmoothed daily mean per individual (should match exactly)\n")
+cat("============================================================\n")
+cat("Max |raw - smoothed| across all individuals:",
+    max(abs(subject_means$daily_mean_activity_raw - subject_means$daily_mean_activity_smoothed)), "\n")
+
+cat("\n============================================================\n")
+cat("SUBJECT-LEVEL SMOOTHED DAILY MEAN ACTIVITY (one value per individual)\n")
+cat("============================================================\n")
+subject_summary <- subject_means %>%
+  group_by(group) %>%
+  summarise(n = n(), mean = mean(daily_mean_activity_smoothed),
+            sd = sd(daily_mean_activity_smoothed), .groups = "drop")
+print(subject_summary, n = Inf)
+
+# ============================================================
+# STEP 9b: WHOLE-DAY OUTLIER CHECK
+# ============================================================
+# Complements the single-minute diagnostic (Step 3) by flagging
+# individuals whose daily mean activity lies outside
+# Q1 - 1.5 x IQR or Q3 + 1.5 x IQR of their own group (the
+# standard box-plot rule). Flagged individuals are reported only.
+# ============================================================
+flag_subject_outliers <- function(df, value_col, group_col = "group", id_col = "id") {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      q1 = quantile(.data[[value_col]], 0.25, na.rm = TRUE),
+      q3 = quantile(.data[[value_col]], 0.75, na.rm = TRUE),
+      iqr = q3 - q1,
+      lower = q1 - 1.5 * iqr,
+      upper = q3 + 1.5 * iqr,
+      is_outlier = .data[[value_col]] < lower | .data[[value_col]] > upper
+    ) %>%
+    ungroup() %>%
+    filter(is_outlier) %>%
+    select(all_of(id_col), all_of(group_col), all_of(value_col), lower, upper)
+}
+
+subject_outliers <- flag_subject_outliers(subject_means, "daily_mean_activity_smoothed")
+
+cat("\n---- Subject-level (whole-day) outliers, boxplot IQR rule ----\n")
+if (nrow(subject_outliers) > 0) {
+  cat("FLAGGED - these individuals' entire-day mean activity falls outside\n")
+  cat("1.5x IQR of their own group, independent of any single-minute burst:\n")
+  print(subject_outliers)
+  cat(
+    "\nIf these reflect real data-quality issues (e.g. a stuck/miscounting\n",
+    "channel) rather than genuine biology, add their channel NUMBER to\n",
+    "EXCLUSIONS[[condition]]$pip / $quin above and re-run the whole script -\n",
+    "excluding them will also correctly update every profile/plot/stat that\n",
+    "used that condition, not just this box plot.\n", sep = ""
+  )
+} else {
+  cat("No subject-level whole-day outliers flagged.\n")
+}
+
+# ============================================================
+# STEP 10: STATISTICAL ANALYSIS
+# ============================================================
+#   1) Two-way linear model (species x photoperiod); Shapiro-Wilk
+#      test on residuals (alpha = 0.05).
+#   2) Normal residuals: Type II ANOVA (car::Anova) and emmeans
+#      pairwise contrasts among the four groups.
+#   3) Non-normal residuals and strictly positive response: refit
+#      on the log scale and retest; if normal, use the log-scale
+#      Type II ANOVA and contrasts.
+#   4) Otherwise: ART ANOVA (Wobbrock et al. 2011) with ART
+#      contrasts (Elkin et al. 2021), ARTool package.
+#   5) Holm adjustment across all six pairwise group comparisons,
+#      after which the two species-within-photoperiod comparisons
+#      are extracted for reporting.
+# ============================================================
+
+# ---- Split an emmeans/ART contrast label ("a b - c d") into its
+#      two sides, each a vector of factor levels. ----
+
+parse_contrast_sides <- function(contrast_str) {
+  sides <- strsplit(contrast_str, " - ", fixed = TRUE)[[1]]
+  lapply(sides, function(s) strsplit(trimws(s), "[ ,]+")[[1]])
+}
+
+# ---- Keep only contrasts between species within the same
+#      photoperiod. ----
+extract_species_within_photoperiod <- function(contrast_df) {
+  keep <- sapply(contrast_df$contrast, function(cs) {
+    parts <- parse_contrast_sides(cs)
+    if (length(parts) != 2 || any(lengths(parts) != 2)) return(FALSE)
+    sp1 <- parts[[1]][1]; ph1 <- parts[[1]][2]
+    sp2 <- parts[[2]][1]; ph2 <- parts[[2]][2]
+    (ph1 == ph2) && (sp1 != sp2)
+  })
+  contrast_df[keep, , drop = FALSE]
+}
+
+# ---- Run the full analysis for one response variable and return
+#      the model, normality results, ANOVA table and contrasts. ----
+compare_groups_full_pipeline <- function(data, response, species_var = "species",
+                                          photoperiod_var = "photoperiod", alpha = 0.05) {
+  data <- as.data.frame(data)
+  data[[species_var]] <- factor(data[[species_var]])
+  data[[photoperiod_var]] <- factor(data[[photoperiod_var]])
+  fml <- as.formula(paste(response, "~", species_var, "*", photoperiod_var))
+
+  result <- list(response = response, alpha = alpha)
+
+  m_raw <- lm(fml, data = data)
+  sh_raw <- shapiro.test(residuals(m_raw))
+  result$shapiro_raw_W <- unname(sh_raw$statistic)
+  result$shapiro_raw_p <- sh_raw$p.value
+  result$normal_raw <- sh_raw$p.value > alpha
+
+  result$shapiro_log_W <- NA
+  result$shapiro_log_p <- NA
+  result$normal_log <- NA
+  result$log_skipped_reason <- NA_character_
+
+  scale_used <- NA
+  model_used <- NULL
+
+  if (sh_raw$p.value > alpha) {
+    scale_used <- "raw"
+    model_used <- m_raw
+    result$decision_rationale <- sprintf(
+      "Raw-scale residuals normal (Shapiro-Wilk W = %.3f, p = %.4f > alpha = %.2f); raw-scale Type II ANOVA used.",
+      result$shapiro_raw_W, result$shapiro_raw_p, alpha
+    )
+  } else {
+    all_positive <- all(data[[response]] > 0, na.rm = TRUE)
+    if (all_positive) {
+      fml_log <- as.formula(paste0("log(", response, ") ~ ", species_var, " * ", photoperiod_var))
+      m_log <- lm(fml_log, data = data)
+      sh_log <- shapiro.test(residuals(m_log))
+      result$shapiro_log_W <- unname(sh_log$statistic)
+      result$shapiro_log_p <- sh_log$p.value
+      result$normal_log <- sh_log$p.value > alpha
+      if (sh_log$p.value > alpha) {
+        scale_used <- "log"
+        model_used <- m_log
+        result$decision_rationale <- sprintf(
+          "Raw-scale residuals non-normal (W = %.3f, p = %.4f); log-scale residuals normal (W = %.3f, p = %.4f > alpha = %.2f); log-scale Type II ANOVA used.",
+          result$shapiro_raw_W, result$shapiro_raw_p, result$shapiro_log_W, result$shapiro_log_p, alpha
+        )
+      } else {
+        result$decision_rationale <- sprintf(
+          "Raw-scale residuals non-normal (W = %.3f, p = %.4f); log-scale residuals also non-normal (W = %.3f, p = %.4f); ART ANOVA used.",
+          result$shapiro_raw_W, result$shapiro_raw_p, result$shapiro_log_W, result$shapiro_log_p
+        )
+      }
+    } else {
+      result$log_skipped_reason <- "response contains non-positive values"
+      result$decision_rationale <- sprintf(
+        "Raw-scale residuals non-normal (W = %.3f, p = %.4f); log transform not attempted (%s); ART ANOVA used.",
+        result$shapiro_raw_W, result$shapiro_raw_p, result$log_skipped_reason
+      )
+    }
+  }
+
+  if (is.na(scale_used)) scale_used <- "ART"
+  result$scale_used <- scale_used
+
+  if (scale_used %in% c("raw", "log")) {
+    result$model <- model_used
+    result$anova_table <- car::Anova(model_used, type = 2)
+
+    emm_fml <- as.formula(paste("~", species_var, "*", photoperiod_var))
+    emm <- emmeans(model_used, emm_fml)
+    full_contrasts <- as.data.frame(pairs(emm, adjust = "holm"))
+    result$full_contrasts <- full_contrasts
+    result$species_within_photoperiod <- extract_species_within_photoperiod(full_contrasts)
+  } else {
+    art_model <- art(fml, data = data)
+    result$model <- art_model
+    result$anova_table <- anova(art_model)
+
+    art_term <- paste(species_var, photoperiod_var, sep = ":")
+    full_contrasts <- as.data.frame(art.con(art_model, art_term, adjust = "holm"))
+    result$full_contrasts <- full_contrasts
+    result$species_within_photoperiod <- extract_species_within_photoperiod(full_contrasts)
+  }
+
+  # ---- One-row summary of the normality tests and the analysis
+  #      used; rows from several response variables can be combined
+  #      with rbind(). ----
+  result$normality_path_row <- data.frame(
+    outcome            = response,
+    shapiro_W_raw       = round(result$shapiro_raw_W, 4),
+    shapiro_p_raw       = round(result$shapiro_raw_p, 4),
+    normal_raw          = result$normal_raw,
+    shapiro_W_log       = if (is.na(result$shapiro_log_W)) NA else round(result$shapiro_log_W, 4),
+    shapiro_p_log       = if (is.na(result$shapiro_log_p)) NA else round(result$shapiro_log_p, 4),
+    normal_log          = result$normal_log,
+    log_skipped_reason  = result$log_skipped_reason,
+    scale_test_used     = c(raw = "Type II ANOVA (raw scale)",
+                             log = "Type II ANOVA (log scale)",
+                             ART = "Aligned Rank Transform ANOVA")[[scale_used]],
+    decision_rationale  = result$decision_rationale,
+    stringsAsFactors = FALSE
+  )
+
+  result
+}
+
+stats_result <- compare_groups_full_pipeline(
+  subject_means, response = "daily_mean_activity_smoothed",
+  species_var = "species", photoperiod_var = "condition"
+)
+
+cat("\n============================================================\n")
+cat("STATISTICS PIPELINE RESULT\n")
+cat("============================================================\n")
+cat("\n---- Normality assessment and analysis path ----\n")
+print(stats_result$normality_path_row)
+cat("\n", stats_result$decision_rationale, "\n", sep = "")
+
+cat("\n---- ANOVA (main effects + interaction) ----\n")
+print(stats_result$anova_table)
+
+cat("\n---- Full 6-comparison family, Holm-adjusted ----\n")
+print(stats_result$full_contrasts)
+
+cat("\n---- Species-within-photoperiod contrasts (for reporting) ----\n")
+print(stats_result$species_within_photoperiod)
+
+# ============================================================
+# STEP 11: DAILY MEAN ACTIVITY BOX PLOT
+# ============================================================
+# One panel per photoperiod, each comparing the two species.
+# Points are individuals (horizontally jittered for visibility).
+# Brackets show the Holm-adjusted species-within-photoperiod
+# comparisons from Step 10. Species names on the x-axis are
+# italicized with plotmath italic() expressions.
+box_data <- subject_means
+species_label_text <- c("Cx. pipiens", "Cx. quinquefasciatus")
+box_data$species_label <- factor(
+  box_data$species,
+  levels = c("pipiens", "quinquefasciatus"),
+  labels = species_label_text
+)
+box_data$condition <- factor(box_data$condition, levels = c("LD", "SD"))
+
+species_colors <- setNames(c(COL_PIP, COL_QUIN), species_label_text)
+
+# Italic x-axis labels, matched to the factor levels by name.
+species_axis_labels <- c(
+  "Cx. pipiens"          = expression(italic("Cx. pipiens")),
+  "Cx. quinquefasciatus" = expression(italic("Cx. quinquefasciatus"))
+)
+
+y_max <- max(box_data$daily_mean_activity_smoothed, na.rm = TRUE)
+y_range <- diff(range(box_data$daily_mean_activity_smoothed, na.rm = TRUE))
+bracket_y <- y_max + 0.08 * y_range
+
+# Convert a p-value to a significance label.
+stars_from_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.0001) "****"
+  else if (p < 0.001) "***"
+  else if (p < 0.01) "**"
+  else if (p < 0.05) "*"
+  else "ns"
+}
+
+swp <- stats_result$species_within_photoperiod
+p_ld <- swp$p.value[grepl("LD", swp$contrast)][1]
+p_sd <- swp$p.value[grepl("SD", swp$contrast)][1]
+
+# One bracket per facet: ggsignif's manual mode draws each row into
+# whichever panel matches its 'condition' value, since that column
+# is also the faceting variable used below. The brackets are drawn
+# without text; the significance labels are added as a separate bold
+# text layer (sig_label_df) so their size and weight can be set.
+sig_df <- data.frame(
+  condition   = factor(c("LD", "SD"), levels = c("LD", "SD")),
+  xmin        = c(1, 1),
+  xmax        = c(2, 2),
+  y_position  = c(bracket_y, bracket_y),
+  annotations = c("", "")
+)
+
+sig_label_df <- data.frame(
+  condition = factor(c("LD", "SD"), levels = c("LD", "SD")),
+  x         = c(1.5, 1.5),
+  y         = c(bracket_y, bracket_y) + 0.02 * y_range,
+  label     = c(stars_from_p(p_ld), stars_from_p(p_sd))
+)
+
+p_box <- ggplot(box_data, aes(x = species_label, y = daily_mean_activity_smoothed, fill = species_label)) +
+  geom_boxplot(width = 0.6, alpha = 0.85, outlier.shape = 21) +
+  geom_jitter(position = position_jitter(width = 0.08, seed = 42), alpha = 0.4, size = 1.2) +
+  geom_signif(
+    data = sig_df,
+    aes(xmin = xmin, xmax = xmax, y_position = y_position, annotations = annotations),
+    manual = TRUE, tip_length = 0.02, inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = sig_label_df,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE, fontface = "bold", size = SIG_LABEL_SIZE, vjust = 0
+  ) +
+  facet_grid(cols = vars(condition), scales = "free_x", space = "free", switch = "x") +
+  scale_fill_manual(values = species_colors, guide = "none") +
+  scale_x_discrete(labels = species_axis_labels) +
+  labs(
+    x = NULL,
+    y = "Daily mean activity (counts / min)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.placement  = "outside",
+    strip.background = element_rect(fill = "grey85", color = "grey30"),
+    strip.text       = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 20, hjust = 1)
+  )
+
+print(p_box)
+
+ggsave("FigE_dailyMeanActivity_boxplot_species_photoperiod.pdf", p_box, width = 6.5, height = 5.5)
+ggsave("FigE_dailyMeanActivity_boxplot_species_photoperiod.png", p_box, width = 6.5, height = 5.5, dpi = 600)
+
+
+# ============================================================
+# STEP 12: SAVE STATISTICAL RESULTS
+# ============================================================
+# activity_stats_full_results.txt: text log of the results from
+#   Steps 9-10 (group summaries, whole-day outliers, normality
+#   tests and analysis path, ANOVA, all six contrasts, and the
+#   species-within-photoperiod contrasts).
+# activity_stats_full_results.csv: the same results as tables.
+# ============================================================
+stats_log <- capture.output({
+  cat("============================================================\n")
+  cat("SUBJECT-LEVEL SMOOTHED DAILY MEAN ACTIVITY (one value per individual)\n")
+  cat("============================================================\n")
+  print(subject_summary, n = Inf)
+
+  cat("\n============================================================\n")
+  cat("SUBJECT-LEVEL (WHOLE-DAY) OUTLIER CHECK - boxplot IQR rule\n")
+  cat("============================================================\n")
+  if (nrow(subject_outliers) > 0) print(subject_outliers) else cat("None flagged.\n")
+
+  cat("\n============================================================\n")
+  cat("NORMALITY ASSESSMENT AND ANALYSIS PATH\n")
+  cat("============================================================\n")
+  print(stats_result$normality_path_row)
+  cat("\n", stats_result$decision_rationale, "\n", sep = "")
+
+  cat("\n---- ANOVA (main effects + interaction) ----\n")
+  print(stats_result$anova_table)
+
+  cat("\n---- Full 6-comparison family, Holm-adjusted ----\n")
+  print(stats_result$full_contrasts)
+
+  cat("\n---- Species-within-photoperiod contrasts (for reporting) ----\n")
+  print(stats_result$species_within_photoperiod)
+})
+writeLines(stats_log, "activity_stats_full_results.txt")
+
+anova_df <- tryCatch(as.data.frame(stats_result$anova_table), error = function(e) NULL)
+
+con <- file("activity_stats_full_results.csv", "w")
+writeLines("SUBJECT-LEVEL SUMMARY", con)
+write.csv(subject_summary, con, row.names = FALSE)
+writeLines("", con)
+writeLines("SUBJECT-LEVEL WHOLE-DAY OUTLIERS (boxplot IQR rule)", con)
+if (nrow(subject_outliers) > 0) write.csv(subject_outliers, con, row.names = FALSE) else writeLines("None flagged", con)
+writeLines("", con)
+writeLines("NORMALITY ASSESSMENT AND ANALYSIS PATH", con)
+write.csv(stats_result$normality_path_row, con, row.names = FALSE)
+writeLines("", con)
+writeLines("ANOVA (MAIN EFFECTS + INTERACTION)", con)
+if (!is.null(anova_df)) write.csv(anova_df, con, row.names = TRUE) else writeLines("(see .txt log - object did not convert cleanly to a data frame)", con)
+writeLines("", con)
+writeLines("FULL 6-COMPARISON FAMILY, HOLM-ADJUSTED", con)
+write.csv(stats_result$full_contrasts, con, row.names = FALSE)
+writeLines("", con)
+writeLines("SPECIES-WITHIN-PHOTOPERIOD CONTRASTS (FOR REPORTING)", con)
+write.csv(stats_result$species_within_photoperiod, con, row.names = FALSE)
+close(con)
+
+message(
+  "\nSaved complete statistical results to activity_stats_full_results.txt ",
+  "and activity_stats_full_results.csv")
+```
+

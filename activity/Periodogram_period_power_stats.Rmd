@@ -1,0 +1,514 @@
+---
+title: "Free-running period and rhythmic power (Lomb-Scargle)"
+author: "gavingeddes"
+date: "2026-07-03"
+output: html_document
+---
+```{r}
+# ============================================================
+# PERIODOGRAM ANALYSIS — SD + LD, 2x2 design
+# ADAPTIVE STATISTICS: per variable, Shapiro-Wilk on model residuals
+# decides the path:
+#   1) raw residuals normal            -> ANOVA on raw scale
+#   2) raw non-normal, variable is
+#      strictly positive, log residuals
+#      normal                          -> ANOVA on log scale
+#   3) otherwise (non-normal, and either
+#      log not tried [signed variable]
+#      or log also failed)             -> ART (Aligned Rank Transform;
+#                                          Wobbrock et al. 2011), computed
+#                                          using the ARTool package
+#                                          (Kay et al.) rather than a
+#                                          manual reimplementation.
+#
+# CORRECTION FAMILY: Holm-Bonferroni is applied GLOBALLY across the full
+# family of all 6 cell-to-cell comparisons among the 4 species x
+# photoperiod groups (emmeans-derived contrasts on the parametric path;
+# ARTool's art.con() output on the ART path). The two a priori planned
+# within-photoperiod contrasts (species within SD, species within LD)
+# are then EXTRACTED from that already-corrected 6-way family for the
+# plotted bracket and the headline LD_pairwise_p/SD_pairwise_p reported
+# in the summary CSV -- they are not re-corrected as a separate, smaller
+# family.
+#
+# Both arms derive their contrasts directly from the fitted model rather
+# than independent per-pair tests: emmeans::contrast() on the parametric
+# path (pooled residual variance -- check homogeneity via Levene's test;
+# if violated, supply a heteroscedasticity-consistent covariance matrix
+# via emmeans's `vcov.` argument, e.g. sandwich::vcovHC()), and ARTool's
+# art.con() (true ART-C per Elkin et al. 2021, via artlm.con()) on the
+# ART path.
+#
+# Power is additionally tried on a log scale first (as in the original
+# script); whichever scale achieves normal residuals is used for ANOVA,
+# and if neither does, ART runs on the RAW scale.
+#
+# Species labels here ("Culex pipiens" / "Culex quinquefasciatus")
+# contain internal spaces, unlike the "Cxpip"/"Cxquin" shorthand used
+# elsewhere in this analysis -- group names are built and parsed
+# dynamically from levels(species) throughout (not hardcoded), and the
+# emmeans contrast parser specifically splits on the LAST space in each
+# side of a contrast label (not the first), since a naive first-space
+# split would incorrectly break "Culex pipiens" apart from its
+# photoperiod suffix.
+# ============================================================
+if (!requireNamespace("ARTool", quietly = TRUE)) install.packages("ARTool")
+library(tidyverse)
+library(readxl)
+library(car)      # for Anova(type = "II"), parametric path only
+library(ARTool)   # for art() / anova.art() / art.con()
+library(emmeans)  # for model-based contrasts on the parametric path
+
+# ---- read files ----
+pip_sd  <- read_excel("pipiens_SD_Periodogram-4.xlsx",  sheet = "All channels") %>%
+  mutate(species = "Culex pipiens", photoperiod = "SD")
+pip_ld  <- read_excel("pipiens_LD_Periodogram-4.xlsx",  sheet = "All channels") %>%
+  mutate(species = "Culex pipiens", photoperiod = "LD")
+quin_sd <- read_excel("quinque_SD_Periodogram-4.xlsx",  sheet = "All channels") %>%
+  mutate(species = "Culex quinquefasciatus", photoperiod = "SD")
+quin_ld <- read_excel("quinque_LD_Periodogram-4.xlsx",  sheet = "All channels") %>%
+  mutate(species = "Culex quinquefasciatus", photoperiod = "LD")
+
+periodogram <- bind_rows(pip_sd, pip_ld, quin_sd, quin_ld) %>%
+  rename(
+    id     = Labels,
+    period = period,
+    power  = power,
+    pval   = p_value
+  ) %>%
+  mutate(
+    species     = factor(species,     levels = c("Culex pipiens", "Culex quinquefasciatus")),
+    # NOTE: photoperiod levels ordered LD, SD so LD renders as the TOP facet
+    # row and SD as the bottom facet row, matching the rest of the analysis.
+    photoperiod = factor(photoperiod, levels = c("LD", "SD")),
+    log_power   = log(power)
+  )
+
+# ---- filter to circadian range (edit if desired) ----
+periodogram_filt <- periodogram %>%
+  filter(period >= 18, period <= 30)
+
+# ============================================================
+# COLORS & LABELS
+# ============================================================
+species_cols <- c(
+  "Culex pipiens"          = "#3B82B8",  # muted warm-leaning blue
+  "Culex quinquefasciatus" = "#C65A1E"   # burnt orange
+)
+species_axis_labels <- c(
+  "Culex pipiens"          = "Cx. pipiens",
+  "Culex quinquefasciatus" = "Cx. quinquefasciatus"
+)
+
+# ============================================================
+# SCATTER PLOTS — generated separately per photoperiod (unchanged style)
+# ============================================================
+make_scatter_plot <- function(pd_label) {
+  df <- periodogram_filt %>% filter(photoperiod == pd_label)
+
+  p_scatter <- ggplot(df, aes(x = period, y = power, color = species)) +
+    geom_point(
+      size = 2,
+      alpha = 0.85,
+      position = position_jitter(width = 0.08, height = 0)
+    ) +
+    facet_wrap(~ species, nrow = 1) +
+    scale_color_manual(values = species_cols, guide = "none") +
+    scale_x_continuous(limits = c(18, 30), breaks = seq(18, 30, 2)) +
+    labs(x = "Period (h)", y = "power") +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "grey90", color = "grey50"),
+      strip.text = element_text(face = "bold"),
+      axis.title = element_text(face = "bold")
+    )
+  print(p_scatter)
+  ggsave(paste0("LS_period_vs_power_", pd_label, ".pdf"), p_scatter, width = 8, height = 5)
+  ggsave(paste0("LS_period_vs_power_", pd_label, ".png"), p_scatter, width = 8, height = 5, dpi = 600)
+  p_scatter
+}
+
+p_scatter_SD <- make_scatter_plot("SD")
+p_scatter_LD <- make_scatter_plot("LD")
+
+# ============================================================
+# HELPERS (shared with the rest of the analysis pipeline)
+# ============================================================
+sig_stars <- function(p) {
+  case_when(
+    is.na(p)    ~ "NA",
+    p <= 0.0001 ~ "****",
+    p <= 0.001  ~ "***",
+    p <= 0.01   ~ "**",
+    p <= 0.05   ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+make_bracket_segments <- function(bracket_df, x_col = "x_pos", tick = NULL) {
+  if (is.null(tick)) tick <- 0.03 * max(abs(bracket_df[[x_col]]), na.rm = TRUE)
+  bind_rows(
+    bracket_df %>% transmute(photoperiod, x = .data[[x_col]], xend = .data[[x_col]], y = 1, yend = 2),
+    bracket_df %>% transmute(photoperiod, x = .data[[x_col]] - tick, xend = .data[[x_col]], y = 1, yend = 1),
+    bracket_df %>% transmute(photoperiod, x = .data[[x_col]] - tick, xend = .data[[x_col]], y = 2, yend = 2)
+  )
+}
+
+# ---- Parse an ARTool contrast label like "Culex pipiens,LD - Culex
+# quinquefasciatus,LD" into its species/photoperiod components. Uses a
+# COMMA delimiter (not space), so it's robust to species names that
+# contain internal spaces. ----
+parse_artool_contrast <- function(contrast_str) {
+  sides <- str_split(contrast_str, " - ", simplify = TRUE)
+  s1 <- str_split(trimws(sides[1]), ",", simplify = TRUE)
+  s2 <- str_split(trimws(sides[2]), ",", simplify = TRUE)
+  tibble(species1 = trimws(s1[1]), photoperiod1 = trimws(s1[2]),
+         species2 = trimws(s2[1]), photoperiod2 = trimws(s2[2]))
+}
+
+# ---- Parse one side of an emmeans contrast label like "Culex pipiens
+# LD" into species + photoperiod, splitting on the LAST space (not the
+# first), since the species name itself may contain spaces. Returns
+# "species_photoperiod" (e.g. "Culex pipiens_LD") to match the group
+# naming used elsewhere. ----
+parse_emmeans_side <- function(x) {
+  trimws(x) %>% str_replace("^(.+) ([^ ]+)$", "\\1_\\2")
+}
+
+# ---- Extract the within-photoperiod contrasts from an already
+# Holm-corrected (across all 6) pairwise table. Group names are built
+# dynamically from the actual species levels, not a hardcoded prefix,
+# since this script's species labels differ from the rest of the
+# analysis. ----
+extract_within_photoperiod <- function(full6_df, label, sp_levels) {
+  purrr::map_dfr(c("LD", "SD"), function(pp) {
+    g1 <- paste0(sp_levels[1], "_", pp); g2 <- paste0(sp_levels[2], "_", pp)
+    m <- full6_df %>% filter((group1 == g1 & group2 == g2) | (group1 == g2 & group2 == g1))
+    m %>% mutate(photoperiod = pp) %>% relocate(photoperiod, .after = comparison)
+  })
+}
+
+# ============================================================
+# ADAPTIVE 2x2 STATISTICS ENGINE
+# ============================================================
+analyze_2x2_adaptive <- function(df, value_col, label, alpha = 0.05) {
+  d <- df %>% filter(!is.na(.data[[value_col]]))
+  form <- as.formula(paste(value_col, "~ species * photoperiod"))
+  mod <- lm(form, data = d)
+
+  resid_sw <- shapiro.test(residuals(mod))
+  is_normal <- resid_sw$p.value >= alpha
+
+  cat("\n====================================\n")
+  cat("Analyzing:", label, "\n")
+  cat("====================================\n")
+  cat("Shapiro-Wilk on model residuals: W =", round(resid_sw$statistic, 4),
+      ", p =", round(resid_sw$p.value, 4),
+      ifelse(is_normal, " --> NORMAL -> using ANOVA\n",
+             " --> NON-NORMAL -> using ART (Aligned Rank Transform, ARTool)\n"))
+
+  sp_levels <- levels(d$species)
+  descriptives <- d %>%
+    group_by(species, photoperiod) %>%
+    summarise(n = n(), mean = mean(.data[[value_col]], na.rm = TRUE),
+              sd = sd(.data[[value_col]], na.rm = TRUE), sem = sd / sqrt(n),
+              median = median(.data[[value_col]], na.rm = TRUE), .groups = "drop")
+  cat("\nDescriptive statistics:\n"); print(descriptives)
+
+  if (is_normal) {
+    aov_tab <- car::Anova(mod, type = "II")
+    cat("\nTwo-way ANOVA (Type II SS):\n"); print(aov_tab)
+
+    # ---- FULL 6-way contrasts via emmeans, derived DIRECTLY from the
+    # fitted model -- this IS the single source of truth for the
+    # plotted bracket. ----
+    em <- emmeans::emmeans(mod, ~ species * photoperiod)
+    con <- emmeans::contrast(em, "pairwise", adjust = "holm")
+    con_summary <- as_tibble(summary(con))
+    cat("\nFull 6-way emmeans contrasts (Holm-corrected across all 6):\n"); print(con_summary)
+
+    posthoc_df <- con_summary %>%
+      separate(contrast, into = c("g1", "g2"), sep = " - ") %>%
+      transmute(comparison = label,
+                group1 = parse_emmeans_side(g1),
+                group2 = parse_emmeans_side(g2),
+                estimate, SE, df, t_value = t.ratio,
+                p_value = p.value, significance = sig_stars(p.value))
+
+    # ---- EXTRACT the 2 a priori planned within-photoperiod contrasts
+    # from the already-corrected 6-way table (no re-correction). ----
+    within <- extract_within_photoperiod(posthoc_df, label, sp_levels)
+    cat("\nWithin-photoperiod contrasts extracted from the globally-corrected 6-way family",
+        "-- this is what's plotted and reported):\n"); print(within)
+
+    bracket_df <- within %>% transmute(photoperiod, p_value)
+
+    subtitle_txt <- sprintf(
+      "ANOVA (residuals normal, Shapiro p=%.3g) — species p=%.3g, photoperiod p=%.3g, interaction p=%.3g",
+      resid_sw$p.value, aov_tab["species", "Pr(>F)"], aov_tab["photoperiod", "Pr(>F)"],
+      aov_tab["species:photoperiod", "Pr(>F)"])
+
+    result <- list(path = "parametric", descriptives = descriptives, omnibus_table = aov_tab,
+                    posthoc_df = posthoc_df, within_photoperiod_df = within, bracket_df = bracket_df,
+                    subtitle = subtitle_txt,
+                    resid_shapiro_p = resid_sw$p.value, resid_shapiro_W = unname(resid_sw$statistic))
+
+  } else {
+    # ---- ARTool: fit the aligned-rank-transformed model ----
+    m <- art(form, data = d)
+    cat("\nARTool alignment diagnostic (summary.art; all values should be ~0):\n")
+    print(summary(m))
+
+    aov_tab <- anova(m)
+    cat("\nARTool omnibus ANOVA (Type III, the package default for ART):\n"); print(aov_tab)
+
+    # ---- FULL 6-way ART-C table via ARTool's art.con(), Holm-corrected
+    # across all 6 -- this IS the single source of truth for the
+    # plotted bracket. ----
+    con_raw <- art.con(m, "species:photoperiod", adjust = "none")
+    con_df <- as_tibble(summary(con_raw))
+    parsed <- purrr::map_dfr(con_df$contrast, parse_artool_contrast)
+    con_df <- bind_cols(con_df, parsed) %>%
+      mutate(p_holm6 = p.adjust(p.value, method = "holm"))
+
+    art_c_df <- con_df %>%
+      transmute(comparison = label,
+                group1 = paste0(species1, "_", photoperiod1),
+                group2 = paste0(species2, "_", photoperiod2),
+                estimate, SE, df, t_value = t.ratio,
+                p_value = p_holm6, significance = sig_stars(p_holm6))
+    cat("\nFull 6-way ART-C contrasts via ARTool (Holm-corrected across all 6):\n")
+    print(art_c_df)
+
+    # ---- EXTRACT the 2 a priori planned within-photoperiod contrasts
+    # from the already-corrected 6-way family (no re-correction).
+    # ARTool's art.con() default already uses a DEDICATED per-contrast
+    # alignment (true ART-C via artlm.con()), not a reused
+    # omnibus-interaction alignment. ----
+    within <- extract_within_photoperiod(art_c_df, label, sp_levels)
+    cat("\nWithin-photoperiod contrasts extracted from the globally-corrected 6-way family",
+        "-- this is what's plotted and reported):\n"); print(within)
+
+    bracket_df <- within %>% transmute(photoperiod, p_value)
+
+    subtitle_txt <- sprintf(
+      "ART (Aligned Rank Transform, ARTool, Type III, residuals non-normal, Shapiro p=%.3g) — species p=%.3g, photoperiod p=%.3g, interaction p=%.3g",
+      resid_sw$p.value, aov_tab$`Pr(>F)`[aov_tab$Term == "species"],
+      aov_tab$`Pr(>F)`[aov_tab$Term == "photoperiod"],
+      aov_tab$`Pr(>F)`[aov_tab$Term == "species:photoperiod"])
+
+    result <- list(path = "nonparametric", descriptives = descriptives, omnibus_table = aov_tab,
+                    art_c_df = art_c_df, within_photoperiod_df = within, bracket_df = bracket_df,
+                    subtitle = subtitle_txt,
+                    resid_shapiro_p = resid_sw$p.value, resid_shapiro_W = unname(resid_sw$statistic))
+  }
+
+  bracket_df <- result$bracket_df %>%
+    mutate(label = sig_stars(p_value), photoperiod = factor(photoperiod, levels = c("LD", "SD")))
+  result$bracket_df <- bracket_df
+  result$label <- label
+  result$value_col <- value_col
+  result
+}
+
+# ============================================================
+# POWER: try log-transform first, exactly like the original script's
+# intent ("tried first on log-transformed power, falls back to raw
+# power if log-transform isn't normal"). We check residual normality
+# on both scales, prefer log if IT is normal (even if raw also is,
+# since log is more appropriate for strictly-positive power values),
+# and fall back to raw (parametric if raw is normal, else nonparametric
+# on raw) if log fails.
+# ============================================================
+analyze_power_adaptive <- function(df, alpha = 0.05) {
+  d <- df %>% filter(!is.na(power))
+  log_mod <- lm(log_power ~ species * photoperiod, data = d)
+  log_resid_p <- shapiro.test(residuals(log_mod))$p.value
+
+  if (log_resid_p >= alpha) {
+    cat("\nPower: log-transform achieved normal residuals (Shapiro p =",
+        round(log_resid_p, 4), ") -> using ANOVA on log(power).\n")
+    res <- analyze_2x2_adaptive(d, "log_power", "Power (log-transformed)")
+  } else {
+    cat("\nPower: log-transform did NOT achieve normal residuals (Shapiro p =",
+        round(log_resid_p, 4), ") -> falling back to raw power.\n")
+    res <- analyze_2x2_adaptive(d, "power", "Power (raw)")
+  }
+  res
+}
+
+# ============================================================
+# RUN ADAPTIVE STATISTICS: Period and Power
+# ============================================================
+res_period <- analyze_2x2_adaptive(periodogram_filt, "period", "Period (h)")
+res_power  <- analyze_power_adaptive(periodogram_filt)
+
+all_results <- list("Period (h)" = res_period, "Power" = res_power)
+
+# ============================================================
+# FULL-DETAIL EXPORT #1: Shapiro-Wilk results for every variable
+# ============================================================
+shapiro_results_export <- purrr::imap_dfr(all_results, function(res, nm) {
+  tibble(
+    variable       = nm,
+    value_used     = res$value_col,
+    shapiro_W      = res$resid_shapiro_W,
+    shapiro_p      = res$resid_shapiro_p,
+    decision       = ifelse(res$path == "parametric", "normal -> ANOVA", "non-normal -> ART (ARTool)"),
+    path_used      = res$path
+  )
+})
+cat("\n====================================\n")
+cat("Shapiro-Wilk results (residuals of value ~ species*photoperiod), all variables\n")
+cat("====================================\n")
+print(shapiro_results_export)
+write.csv(shapiro_results_export, "periodogram_shapiro_wilk_results_all_variables.csv", row.names = FALSE)
+
+# ============================================================
+# FULL-DETAIL EXPORT #2: complete omnibus test tables (ANOVA or ARTool
+# ART), long format so both test types share one file
+# ============================================================
+tidy_omnibus <- function(res, nm) {
+  if (res$path == "parametric") {
+    tab <- res$omnibus_table
+    as_tibble(tab, rownames = "term") %>%
+      filter(term != "Residuals") %>%
+      transmute(
+        variable = nm, test_used = "Two-way ANOVA (Type II)", term,
+        sum_sq = `Sum Sq`, df = Df, statistic_name = "F", statistic_value = `F value`,
+        p_value = `Pr(>F)`
+      )
+  } else {
+    tab <- res$omnibus_table
+    as_tibble(tab) %>%
+      transmute(
+        variable = nm, test_used = "ART (ARTool, Type III)", term = Term,
+        sum_sq = `Sum Sq`, df = Df, statistic_name = "F", statistic_value = `F value`,
+        p_value = `Pr(>F)`
+      )
+  }
+}
+
+omnibus_results_export <- purrr::imap_dfr(all_results, tidy_omnibus)
+cat("\n====================================\n")
+cat("Full omnibus test results (ANOVA or ARTool ART), all variables\n")
+cat("====================================\n")
+print(omnibus_results_export)
+write.csv(omnibus_results_export, "periodogram_omnibus_test_results_all_variables.csv", row.names = FALSE)
+
+# ============================================================
+# FULL-DETAIL EXPORT #3: full 6-way pairwise family (emmeans or ARTool
+# ART-C, whichever ran), Holm-corrected across all 6 -- this is the
+# single source of truth every reported p-value is drawn from.
+# ============================================================
+posthoc_export <- bind_rows(
+  if (res_period$path == "parametric") res_period$posthoc_df else res_period$art_c_df,
+  if (res_power$path  == "parametric") res_power$posthoc_df  else res_power$art_c_df
+)
+write.csv(posthoc_export, "periodogram_pairwise_full6_global.csv", row.names = FALSE)
+cat("\nSaved (the globally-corrected full 6-way family): periodogram_pairwise_full6_global.csv\n")
+
+# ---- The 2 a priori planned within-photoperiod contrasts, EXTRACTED
+# (not re-corrected) from the full 6-way family above. ----
+within_photoperiod_export <- bind_rows(res_period$within_photoperiod_df, res_power$within_photoperiod_df)
+cat("\n====================================\n")
+cat("Within-photoperiod contrasts extracted from the globally-corrected 6-way family\n")
+cat("====================================\n")
+print(within_photoperiod_export)
+write.csv(within_photoperiod_export, "periodogram_within_photoperiod_extracted.csv", row.names = FALSE)
+cat("\nSaved (THIS is the plotted result): periodogram_within_photoperiod_extracted.csv\n")
+
+summarize_result <- function(res) {
+  if (res$path == "parametric") {
+    tibble(variable = res$label, value_used = res$value_col, statistical_path = "ANOVA (residuals normal)",
+           shapiro_p_residuals = res$resid_shapiro_p,
+           species_p = res$omnibus_table["species", "Pr(>F)"],
+           photoperiod_p = res$omnibus_table["photoperiod", "Pr(>F)"],
+           interaction_p = res$omnibus_table["species:photoperiod", "Pr(>F)"],
+           LD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "LD"],
+           SD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "SD"])
+  } else {
+    tab <- res$omnibus_table
+    tibble(variable = res$label, value_used = res$value_col, statistical_path = "ART (ARTool, Type III, residuals non-normal)",
+           shapiro_p_residuals = res$resid_shapiro_p,
+           species_p = tab$`Pr(>F)`[tab$Term == "species"],
+           photoperiod_p = tab$`Pr(>F)`[tab$Term == "photoperiod"],
+           interaction_p = tab$`Pr(>F)`[tab$Term == "species:photoperiod"],
+           LD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "LD"],
+           SD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "SD"])
+  }
+}
+
+periodogram_stats_summary <- bind_rows(summarize_result(res_period), summarize_result(res_power))
+cat("\n====================================\n")
+cat("Periodogram adaptive-statistics summary\n")
+cat("====================================\n")
+print(periodogram_stats_summary)
+write.csv(periodogram_stats_summary, "periodogram_statistics_adaptive.csv", row.names = FALSE)
+
+# ============================================================
+# SHARED PLOT BUILDER: boxplot + jitter, all 4 groups on one panel,
+# stacked photoperiod rows (LD top, SD bottom), bracket uses whichever
+# test (emmeans or ART-C) was appropriate. (unchanged)
+# ============================================================
+make_periodogram_plot <- function(df, var, x_label, title_label, res, x_limits = NULL) {
+  d <- df %>% filter(!is.na(.data[[var]]))
+  x_max <- max(d[[var]], na.rm = TRUE)
+  bracket <- res$bracket_df %>% mutate(x_pos = x_max * 1.08)
+  bracket_segments <- make_bracket_segments(bracket, x_col = "x_pos")
+
+  p <- ggplot(d, aes(y = species, x = .data[[var]], fill = species)) +
+    geom_boxplot(outlier.shape = NA, width = 0.55, alpha = 0.6, color = "black") +
+    geom_jitter(aes(color = species), height = 0.15, width = 0, size = 2, alpha = 0.7) +
+    geom_segment(data = bracket_segments,
+                 aes(x = x, xend = xend, y = y, yend = yend),
+                 inherit.aes = FALSE, linewidth = 0.4) +
+    geom_text(data = bracket, aes(x = x_pos + x_max * 0.02, y = 1.5, label = label),
+              inherit.aes = FALSE, size = 3.8, hjust = 0) +
+    facet_grid(photoperiod ~ ., switch = "y") +
+    scale_fill_manual(values  = species_cols, drop = FALSE) +
+    scale_color_manual(values = species_cols, drop = FALSE) +
+    scale_y_discrete(limits = c("Culex quinquefasciatus", "Culex pipiens"), labels = species_axis_labels) +
+    labs(x = x_label, y = NULL, title = title_label, subtitle = res$subtitle) +
+    theme_classic() +
+    theme(
+      legend.position   = "none",
+      panel.spacing     = unit(0, "pt"),
+      strip.placement   = "outside",
+      strip.background  = element_rect(fill = "grey90", color = "grey50"),
+      strip.text.y.left = element_text(face = "bold", angle = 0),
+      plot.subtitle     = element_text(size = 8.5)
+    )
+
+  if (!is.null(x_limits)) p <- p + coord_cartesian(xlim = x_limits, clip = "off")
+  p
+}
+
+# ============================================================
+# PLOT: PERIOD — LD panel above SD panel, continuous shared x-axis
+# ============================================================
+p_period <- make_periodogram_plot(
+  df = periodogram_filt, var = "period",
+  x_label = "Period (hours)", title_label = "Free-running period (Lomb-Scargle)",
+  res = res_period, x_limits = c(18, NA)
+)
+print(p_period)
+ggsave("Fig_period_4groups_adaptive.png", p_period, width = 7, height = 5, dpi = 600)
+
+# ============================================================
+# PLOT: POWER — LD panel above SD panel, continuous shared x-axis
+# NOTE: plotted on the RAW power scale regardless of which scale the
+# statistics used, so the figure stays interpretable in original units;
+# the subtitle states plainly whether log(power) or raw power was
+# actually tested.
+# ============================================================
+p_power <- make_periodogram_plot(
+  df = periodogram_filt, var = "power",
+  x_label = "Power (Lomb-Scargle)", title_label = "Rhythmic power (Lomb-Scargle)",
+  res = res_power
+)
+print(p_power)
+ggsave("Fig_power_4groups_adaptive.png", p_power, width = 7, height = 5, dpi = 600)
+```
+

@@ -1,0 +1,955 @@
+---
+title: "Figs. 4-5 - qRT-PCR rhythm analysis (CircaCompare)"
+author: "gavingeddes"
+date: "2026-03-22"
+output: html_document
+---
+```{r}
+# ============================================================
+# Circadian analysis of qRT-PCR expression data: cycle (CYC)
+# Culex pipiens and Culex quinquefasciatus, short-day (SD) and
+# long-day (LD) photoperiods
+#
+# Overview
+#   This script tests for daily (24 h) rhythmicity in relative
+#   mRNA expression and compares rhythm parameters between groups
+#   using the CircaCompare R package.
+#
+#   Two sets of comparisons are made:
+#     (A) Species (Cx. pipiens vs Cx. quinquefasciatus) within
+#         each photoperiod (SD, LD).
+#     (B) Photoperiod (SD vs LD) within each species.
+#
+# Statistical approach
+#   1. Rhythmicity of each group is tested individually with
+#      circa_single(), which fits a cosinor model with a fixed
+#      24 h period. A group is called rhythmic when its
+#      rhythmic_p value is below alpha_threshold.
+#   2. Differences in mesor, amplitude, and phase between the two
+#      groups in each comparison are tested with circacompare().
+#   3. A two-way ANOVA (group x ZT) with Tukey-adjusted pairwise
+#      comparisons at each ZT is run as a supplementary test when
+#      at least one group is not significantly rhythmic, when a
+#      circa_single() fit does not converge, or when circacompare()
+#      does not return a result. In these cases rhythm-parameter
+#      comparisons are not appropriate, and the ANOVA provides a
+#      model-independent test of expression differences.
+#   4. Fitted curves shown on the plots are computed directly from
+#      each group's circa_single() estimates using
+#          y = mesor + amplitude * cos(2*pi*t/24 - phase)
+#      No separate model is fitted for plotting.
+#
+# Figures
+#   Each plot shows individual samples (black circles and gray
+#   triangles), the fitted cosinor curve for each group (dashed),
+#   and a light/dark bar for the photoperiod(s) beneath the x-axis.
+#   A boxed key identifies each group and gives its rhythmicity
+#   call: (+) significantly rhythmic, (-) not significantly
+#   rhythmic, (?) no usable fit. The key sits in the top-right
+#   corner of the panel; a small space (key_space_fraction of the
+#   panel height) is left above the data to make room for it. The
+#   y-axis uses ggplot2's default tick marks.
+#
+# Input
+#   An Excel file (one sheet) in long format, with one row per
+#   sample and the following columns (common alternative column
+#   names are recognized; see Section 4):
+#     gene         gene identifier (e.g. CYC)
+#     species      Cx. pipiens or Cx. quinquefasciatus
+#     photoperiod  SD or LD
+#     zt           Zeitgeber time of sampling (hours)
+#     replicate    biological replicate number
+#     expr         relative expression (2^-ddCt)
+#
+# Output (written to output_dir)
+#   00_cleaned_full_data.csv            cleaned input data
+#   within_photoperiod/<SD|LD>/         species comparisons
+#   between_photoperiod/<species>/      photoperiod comparisons
+#   99_compiled_results_tables.xlsx     all result tables
+#   98_session_diagnostics.txt          package function signatures
+#
+#   Each comparison folder contains:
+#     00_analysis_decision_note.txt          whether the ANOVA was run, and why
+#     01_cleaned_long_data.csv               data used for the comparison
+#     02_summary_stats.csv                   mean, SD, SE by group and ZT
+#     03_circa_single_results.txt            circa_single() output per group
+#     04_circa_single_parameter_estimates.csv
+#     05_circacompare_results.txt            circacompare() output
+#     05_circacompare_parameter_estimates.csv
+#     06_*                                   ANOVA/Tukey results (if run)
+#     07_rhythmicity_calls.csv               + rhythmic, - not rhythmic, ? no fit
+#     08_plot_predictions_from_circa_single.csv
+#     09_*_plot.png / .pdf                   figures
+#
+# Requirements
+#   R (>= 4.1, for the native pipe |>) and the packages listed in
+#   Section 1.
+#
+# Reference
+#   Parsons R, Parsons R, Garner N, Oster H, Rawashdeh O (2020).
+#   CircaCompare: a method to estimate and statistically support
+#   differences in mesor, amplitude and phase, between circadian
+#   rhythms. Bioinformatics 36(4): 1208-1212.
+# ============================================================
+
+# -----------------------------
+# 1. Install / load packages
+# -----------------------------
+cran_packages <- c(
+  "openxlsx", "dplyr", "tidyr", "stringr", "ggplot2",
+  "purrr", "emmeans", "writexl", "remotes"
+)
+installed <- rownames(installed.packages())
+to_install <- setdiff(cran_packages, installed)
+if (length(to_install) > 0) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+if (!requireNamespace("circacompare", quietly = TRUE)) {
+  remotes::install_github("rwparsons/CircaCompare", force = TRUE, dependencies = TRUE)
+}
+
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(emmeans)
+library(writexl)
+library(circacompare)
+
+# -----------------------------
+# 2. User settings
+# -----------------------------
+input_file      <- "CYC_ddct.xlsx"
+sheet_name      <- 1
+output_dir      <- "CYC_results_expanded"
+target_gene     <- "CYC"
+period_hr       <- 24
+alpha_threshold <- 0.05   # significance level for rhythmicity (circa_single)
+                          # and for between-group tests (circacompare)
+
+# Gene name as displayed (in italics) on the plot y-axis.
+gene_label   <- "cycle"
+y_axis_label <- bquote("Relative" ~ italic(.(gene_label)) ~ "mRNA expression")
+
+# Zeitgeber time (h) at which lights turn off under each photoperiod.
+# Used only to draw the light/dark bars beneath each plot.
+# SD = short day (9L:15D, lights off at ZT9); LD = long day (15L:9D,
+# lights off at ZT15).
+light_end_by_pd <- c(SD = 9, LD = 15)
+
+# Text size of the "SD"/"LD" labels beside the light/dark bars.
+bar_label_size <- 4
+
+# Point appearance for the two groups in each plot (first group,
+# second group): filled circle in black, filled triangle in gray.
+point_shapes  <- c(16, 17)
+point_colours <- c("black", "gray55")
+
+# Key position (top-right corner of the panel) and the fraction of
+# the panel height left empty above the data to make room for it.
+key_position       <- c(0.98, 0.98)
+key_space_fraction <- 0.18
+
+species_levels     <- c("Cx. pipiens", "Cx. quinquefasciatus")
+photoperiod_levels <- c("SD", "LD")
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# Convert a label (e.g. "Cx. pipiens") into a folder-safe name ("Cx_pipiens").
+clean_label <- function(x) {
+  x %>%
+    str_replace_all("[^A-Za-z]+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+# -----------------------------
+# 3. Read input file
+# -----------------------------
+df_raw <- openxlsx::read.xlsx(input_file, sheet = sheet_name, colNames = TRUE, detectDates = TRUE)
+
+# Standardize column names: lowercase, underscores in place of spaces/dots.
+names(df_raw) <- names(df_raw) |>
+  str_trim() |>
+  str_to_lower() |>
+  str_replace_all("\\s+", "_") |>
+  str_replace_all("\\.+", "_")
+
+cat("\nCleaned input column names:\n")
+print(names(df_raw))
+
+# -----------------------------
+# 4. Map column names to the names used in this script
+# -----------------------------
+rename_if_present <- function(df, old_names, new_name) {
+  hit <- names(df)[names(df) %in% old_names]
+  if (length(hit) > 0) {
+    names(df)[names(df) == hit[1]] <- new_name
+  }
+  df
+}
+
+df <- df_raw
+df <- rename_if_present(df, c("gene"), "gene")
+df <- rename_if_present(df, c("species", "taxon"), "species")
+df <- rename_if_present(df, c("photoperiod", "photo_period", "daylength"), "photoperiod")
+df <- rename_if_present(df, c("zt", "zeitgeber_time", "time"), "zt")
+df <- rename_if_present(df, c("replicate", "rep", "sample", "biorep"), "replicate")
+df <- rename_if_present(df, c("expr", "expression", "relative_expression", "relative_mrna", "ddct", "delta_delta_ct"), "expr")
+
+required_cols <- c("gene", "species", "photoperiod", "zt", "replicate", "expr")
+missing_cols <- setdiff(required_cols, names(df))
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns after renaming: ",
+    paste(missing_cols, collapse = ", "),
+    "\nCurrent columns are: ",
+    paste(names(df), collapse = ", ")
+  )
+}
+
+# -----------------------------
+# 5. Clean values and subset to the target gene
+# -----------------------------
+# Species names are standardized to "Cx. pipiens" / "Cx. quinquefasciatus";
+# rows with any missing required value are removed.
+df <- df %>%
+  mutate(
+    gene = str_trim(as.character(gene)),
+    species = str_trim(as.character(species)),
+    photoperiod = str_trim(as.character(photoperiod)),
+    zt = as.numeric(zt),
+    replicate = as.integer(replicate),
+    expr = as.numeric(expr)
+  ) %>%
+  mutate(
+    species = case_when(
+      str_to_lower(species) %in% c("pipiens", "cx_pipiens", "cx. pipiens", "cx pipiens") ~ "Cx. pipiens",
+      str_to_lower(species) %in% c("quinquefasciatus", "quin", "cx_quinquefasciatus", "cx. quinquefasciatus", "cx quinquefasciatus") ~ "Cx. quinquefasciatus",
+      TRUE ~ species
+    ),
+    photoperiod = str_to_upper(photoperiod),
+    gene = str_to_upper(gene)
+  ) %>%
+  filter(
+    !is.na(gene),
+    !is.na(species),
+    !is.na(photoperiod),
+    !is.na(zt),
+    !is.na(replicate),
+    !is.na(expr)
+  )
+
+dat_all <- df %>%
+  filter(gene == toupper(target_gene)) %>%
+  mutate(
+    species = factor(species, levels = species_levels),
+    photoperiod = factor(photoperiod, levels = photoperiod_levels),
+    zt_factor = factor(zt, levels = sort(unique(zt)))
+  ) %>%
+  filter(!is.na(species), !is.na(photoperiod))
+
+if (nrow(dat_all) == 0) stop("No rows found after filtering for gene = ", target_gene)
+
+# Sample counts by species, photoperiod, and ZT (printed for checking).
+cat("\n====================\n")
+cat("DATA QC (all photoperiods x species)\n")
+cat("====================\n")
+print(table(dat_all$species, dat_all$photoperiod, dat_all$zt))
+
+write.csv(dat_all, file.path(output_dir, "00_cleaned_full_data.csv"), row.names = FALSE)
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+# ---- Extract the parameter/value summary table from a
+#      circa_single() or circacompare() result.
+#      The position of this table in the returned list can differ
+#      between package versions, so the list is searched for the
+#      data frame with "parameter" and "value" columns. ----
+get_circa_summary <- function(fit_obj) {
+  if (is.null(fit_obj)) return(NULL)
+
+  # Check the named "summary" element first.
+  if (!is.null(fit_obj$summary) && is.data.frame(fit_obj$summary) &&
+      all(c("parameter", "value") %in% names(fit_obj$summary))) {
+    return(fit_obj$summary)
+  }
+
+  # Otherwise search all list elements.
+  if (is.list(fit_obj)) {
+    for (el in fit_obj) {
+      if (is.data.frame(el) && all(c("parameter", "value") %in% names(el))) {
+        return(el)
+      }
+    }
+  }
+  NULL
+}
+
+# ---- Fit circa_single() to each group and write a text report ----
+# Returns a named list of circa_single() results (NULL for any group
+# whose fit failed). Warnings are recorded in the report. The
+# function's own printing and plotting are turned off
+# (suppress_all = TRUE, return_figure = FALSE) so the script can run
+# without a graphics device; the report is assembled in memory and
+# written with writeLines().
+run_circa_single_by_group <- function(dat, group_var, group_levels, out_txt_path) {
+  fits <- list()
+  lines_out <- c(paste0("circa_single results, grouped by ", group_var), "")
+
+  for (g in group_levels) {
+    subdat <- dat[dat[[group_var]] == g, ]
+    lines_out <- c(lines_out, strrep("-", 50), paste0(group_var, ": ", g), strrep("-", 50))
+
+    if (nrow(subdat) == 0) {
+      fits[[g]] <- NULL
+      lines_out <- c(lines_out, "No rows available for this group.", "")
+      next
+    }
+
+    warn_msgs <- character(0)
+    fit <- withCallingHandlers(
+      tryCatch(
+        circacompare::circa_single(
+          x = subdat, col_time = "zt", col_outcome = "expr",
+          period = period_hr, alpha_threshold = alpha_threshold,
+          return_figure = FALSE, suppress_all = TRUE
+        ),
+        error = function(e) e
+      ),
+      warning = function(w) {
+        warn_msgs <<- c(warn_msgs, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    )
+
+    if (inherits(fit, "error")) {
+      fits[[g]] <- NULL
+      lines_out <- c(
+        lines_out,
+        "circa_single FAILED TO RUN for this group:",
+        conditionMessage(fit), ""
+      )
+    } else {
+      fits[[g]] <- fit
+      if (length(warn_msgs) > 0) {
+        lines_out <- c(lines_out, "Warnings during fit (fit still used):", warn_msgs, "")
+      }
+      summ <- get_circa_summary(fit)
+      if (!is.null(summ)) {
+        lines_out <- c(lines_out, capture.output(print(summ)), "")
+      } else {
+        lines_out <- c(
+          lines_out,
+          "circa_single ran without error, but no parameter/value summary",
+          "table could be located in its return object.",
+          paste0("Returned list element names: ", paste(names(fit), collapse = ", ")),
+          "Raw structure:",
+          capture.output(str(fit)),
+          ""
+        )
+      }
+    }
+  }
+
+  writeLines(lines_out, out_txt_path)
+  fits
+}
+
+# ---- Extract rhythmic_p, mesor, amplitude, phase, and period for one
+#      group from its circa_single() result. A group with no usable
+#      result is returned with NA values and converged = FALSE. ----
+extract_circa_single_params <- function(fit_obj, label) {
+  if (is.null(fit_obj)) {
+    return(data.frame(
+      group = label, rhythmic_p = NA_real_, mesor = NA_real_,
+      amplitude = NA_real_, phase_radians = NA_real_, period_est = NA_real_,
+      converged = FALSE, stringsAsFactors = FALSE
+    ))
+  }
+
+  summ <- get_circa_summary(fit_obj)
+  if (is.null(summ)) {
+    # No summary table found in the result; treat as no usable fit.
+    return(data.frame(
+      group = label, rhythmic_p = NA_real_, mesor = NA_real_,
+      amplitude = NA_real_, phase_radians = NA_real_, period_est = NA_real_,
+      converged = FALSE, stringsAsFactors = FALSE
+    ))
+  }
+
+  get_val <- function(p) {
+    v <- summ$value[summ$parameter == p]
+    if (length(v) == 0) NA_real_ else v[1]
+  }
+
+  data.frame(
+    group = label,
+    rhythmic_p = get_val("rhythmic_p"),
+    mesor = get_val("mesor"),
+    amplitude = get_val("amplitude"),
+    phase_radians = get_val("phase_radians"),
+    period_est = get_val("period"),
+    converged = TRUE,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---- Compare rhythm parameters between two groups with
+#      circacompare() and write a text report. Returns the
+#      circacompare() result, or an error object if it did not run. ----
+run_circacompare_between_groups <- function(dat, group_var, out_txt_path) {
+  dat2 <- dat
+  dat2$comparison_group <- as.character(dat2[[group_var]])
+
+  warn_msgs <- character(0)
+  fit <- withCallingHandlers(
+    tryCatch(
+      circacompare::circacompare(
+        x = dat2, col_time = "zt", col_group = "comparison_group",
+        col_outcome = "expr", period = period_hr, alpha_threshold = alpha_threshold,
+        suppress_all = TRUE
+      ),
+      error = function(e) e
+    ),
+    warning = function(w) {
+      warn_msgs <<- c(warn_msgs, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  lines_out <- c(paste0("circacompare results, comparing ", group_var), "")
+  if (inherits(fit, "error")) {
+    lines_out <- c(lines_out, "circacompare FAILED / DID NOT RUN:", conditionMessage(fit), "")
+  } else {
+    if (length(warn_msgs) > 0) {
+      lines_out <- c(lines_out, "Warnings during fit (fit still used):", warn_msgs, "")
+    }
+    summ <- get_circa_summary(fit)
+    if (!is.null(summ)) {
+      lines_out <- c(lines_out, capture.output(print(summ)), "")
+    } else {
+      lines_out <- c(
+        lines_out,
+        "circacompare ran without error, but no parameter/value summary",
+        "table could be located in its return object.",
+        paste0("Returned list element names: ", paste(names(fit), collapse = ", ")),
+        ""
+      )
+    }
+  }
+  writeLines(lines_out, out_txt_path)
+
+  fit
+}
+
+# ---- Two-way ANOVA (group x ZT) with Tukey-adjusted pairwise
+#      comparisons between groups at each ZT. Run only when the
+#      conditions in run_group_comparison_core() are met. ----
+run_anova_tukey <- function(dat, group_var, out_dir, prefix) {
+  form <- as.formula(paste("expr ~", group_var, "* zt_factor"))
+  lm_fit <- lm(form, data = dat)
+  anova_res <- anova(lm_fit)
+
+  anova_df <- as.data.frame(anova_res)
+  anova_df$term <- rownames(anova_df)
+  rownames(anova_df) <- NULL
+  write.csv(anova_df, file.path(out_dir, paste0(prefix, "_two_way_anova.csv")), row.names = FALSE)
+
+  sink(file.path(out_dir, paste0(prefix, "_lm_summary.txt")))
+  cat("Linear model summary (ANOVA fallback)\n\n")
+  print(summary(lm_fit))
+  cat("\n\nTwo-way ANOVA\n\n")
+  print(anova_res)
+  sink()
+
+  emm_form <- as.formula(paste("~", group_var, "| zt_factor"))
+  emm <- emmeans::emmeans(lm_fit, emm_form)
+  pw <- emmeans::contrast(emm, method = "pairwise", adjust = "tukey")
+  pw_df <- as.data.frame(pw)
+  write.csv(pw_df, file.path(out_dir, paste0(prefix, "_pairwise_by_ZT_tukey.csv")), row.names = FALSE)
+
+  list(anova = anova_df, pairwise = pw_df, lm_fit = lm_fit)
+}
+
+# ---- Compute the fitted cosinor curve for one group from its
+#      circa_single() estimates:
+#          y = mesor + amplitude * cos(2*pi*t/period_hr - phase)
+#      period_hr is the fixed period passed to circa_single().
+#      Returns NULL when the group has no usable fit. ----
+build_curve_from_circa_single <- function(params_row, zt_min, zt_max) {
+  if (isFALSE(params_row$converged) || any(is.na(params_row[c("mesor", "amplitude", "phase_radians")]))) {
+    return(NULL)
+  }
+
+  mesor     <- params_row$mesor
+  amplitude <- params_row$amplitude
+  phi       <- params_row$phase_radians
+
+  newdat <- data.frame(zt = seq(zt_min, zt_max, length.out = 300))
+  newdat$fit <- mesor + amplitude * cos((2 * pi * newdat$zt / period_hr) - phi)
+  newdat$group <- params_row$group
+  newdat$model_used <- "circa_single_estimated_parameters (cosinor: y = mesor + amplitude*cos(2*pi*t/24 - phi))"
+  newdat
+}
+
+# ---- Run one two-group comparison:
+#      circa_single() per group -> circacompare() -> ANOVA/Tukey
+#      (when required) -> rhythmicity calls -> fitted curves ----
+run_group_comparison_core <- function(dat, group_var, group_levels, out_dir) {
+
+  circa_fits <- run_circa_single_by_group(
+    dat, group_var, group_levels,
+    file.path(out_dir, "03_circa_single_results.txt")
+  )
+
+  params_df <- bind_rows(
+    lapply(group_levels, function(g) extract_circa_single_params(circa_fits[[g]], g))
+  )
+  write.csv(params_df, file.path(out_dir, "04_circa_single_parameter_estimates.csv"), row.names = FALSE)
+
+  # Between-group comparison of mesor, amplitude, and phase.
+  cc_fit <- run_circacompare_between_groups(
+    dat, group_var, file.path(out_dir, "05_circacompare_results.txt")
+  )
+
+  # Save circacompare() estimates and p-values as a table.
+  cc_summ <- if (!inherits(cc_fit, "error")) get_circa_summary(cc_fit) else NULL
+  if (!is.null(cc_summ)) {
+    circacompare_params <- cc_summ
+  } else {
+    circacompare_params <- data.frame(
+      parameter = "circacompare_failed_or_no_summary_found",
+      value = if (inherits(cc_fit, "error")) conditionMessage(cc_fit) else NA_character_,
+      stringsAsFactors = FALSE
+    )
+  }
+  write.csv(
+    circacompare_params,
+    file.path(out_dir, "05_circacompare_parameter_estimates.csv"),
+    row.names = FALSE
+  )
+
+  # The ANOVA/Tukey test is run when either:
+  #   (a) at least one group is not significantly rhythmic
+  #       (rhythmic_p >= alpha_threshold) or has no usable fit, or
+  #   (b) circacompare() did not return a result (it does not fit
+  #       a comparison when one group is arrhythmic).
+  circacompare_failed <- inherits(cc_fit, "error")
+  circa_single_nonrhythmic <- any(is.na(params_df$rhythmic_p) | params_df$rhythmic_p >= alpha_threshold)
+  needs_fallback <- circa_single_nonrhythmic || circacompare_failed
+
+  if (needs_fallback) {
+    aov_res <- run_anova_tukey(dat, group_var, out_dir, "06")
+
+    flagged <- params_df %>%
+      filter(is.na(rhythmic_p) | rhythmic_p >= alpha_threshold) %>%
+      pull(group)
+
+    reasons <- character(0)
+    if (length(flagged) > 0) {
+      reasons <- c(reasons, paste0(
+        "circa_single did not detect significant rhythmicity (alpha = ",
+        alpha_threshold, ") in: ", paste(flagged, collapse = ", "), "."
+      ))
+    }
+    if (circacompare_failed) {
+      reasons <- c(reasons, paste0(
+        "circacompare itself failed to run for this comparison (see ",
+        "05_circacompare_results.txt for the exact message) — most commonly ",
+        "because it refuses to fit when one of the two groups is arrhythmic."
+      ))
+    }
+
+    trailing_note <- if (circacompare_failed) {
+      paste0(
+        "No circacompare result exists for this comparison, so the ANOVA/Tukey ",
+        "results in 06_* are the primary statistical comparison here.\n"
+      )
+    } else {
+      paste0(
+        "circacompare (05_circacompare_results.txt) remains the primary rhythm-parameter ",
+        "comparison, but its mesor/amplitude/phase differences should be interpreted ",
+        "cautiously for any group that is not itself rhythmic. The ANOVA/Tukey results ",
+        "in 06_* provide a rhythm-model-independent test of expression differences by ",
+        "group and ZT.\n"
+      )
+    }
+
+    note <- paste0(
+      "ANOVA + Tukey fallback WAS run.\n",
+      "Reason(s):\n  - ", paste(reasons, collapse = "\n  - "), "\n",
+      trailing_note
+    )
+  } else {
+    aov_res <- NULL
+    note <- paste0(
+      "ANOVA + Tukey fallback was NOT run.\n",
+      "Reason: circa_single detected significant rhythmicity (alpha = ", alpha_threshold,
+      ") in all compared groups, and circacompare ran successfully, so ",
+      "circacompare (05_circacompare_results.txt) is used as the complete ",
+      "statistical comparison for this analysis."
+    )
+  }
+  writeLines(note, file.path(out_dir, "00_analysis_decision_note.txt"))
+
+  # Rhythmicity calls: "+" rhythmic, "-" not rhythmic, "?" no usable fit.
+  rhythmicity_df <- params_df %>%
+    mutate(
+      rhythmicity = case_when(
+        is.na(rhythmic_p) ~ "?",
+        rhythmic_p < alpha_threshold ~ "+",
+        TRUE ~ "-"
+      )
+    ) %>%
+    select(group, rhythmic_p, rhythmicity)
+  write.csv(rhythmicity_df, file.path(out_dir, "07_rhythmicity_calls.csv"), row.names = FALSE)
+
+  # Fitted curves for plotting.
+  zt_min <- min(dat$zt); zt_max <- max(dat$zt)
+  pred_df <- bind_rows(
+    lapply(seq_len(nrow(params_df)), function(i) {
+      build_curve_from_circa_single(params_df[i, ], zt_min, zt_max)
+    })
+  )
+  write.csv(pred_df, file.path(out_dir, "08_plot_predictions_from_circa_single.csv"), row.names = FALSE)
+
+  list(
+    circa_fits = circa_fits, params = params_df, circacompare = cc_fit,
+    circacompare_params = circacompare_params,
+    anova = aov_res, rhythmicity = rhythmicity_df, predictions = pred_df,
+    fallback_used = needs_fallback
+  )
+}
+
+# ============================================================
+# Plotting helpers
+# ============================================================
+
+# ---- Key labels combining each group's name with its rhythmicity
+#      call, e.g. "Cx. pipiens (+)". Species names are italicized. ----
+make_key_labels <- function(groups, rhythmicity_df, italic_names = FALSE) {
+  lapply(groups, function(g) {
+    call <- rhythmicity_df$rhythmicity[rhythmicity_df$group == g]
+    if (length(call) == 0 || is.na(call)) call <- "?"
+    call_txt <- paste0("(", call, ")")
+    if (italic_names) {
+      bquote(italic(.(g)) ~ .(call_txt))
+    } else {
+      bquote(.(g) ~ .(call_txt))
+    }
+  })
+}
+
+# ---- Upper y-axis limit that leaves the top key_space_fraction of
+#      the panel empty above the highest data point or fitted value. ----
+key_safe_ymax <- function(y_top_data, y_lower) {
+  (y_top_data - key_space_fraction * y_lower) / (1 - key_space_fraction)
+}
+
+# ---- Theme elements that draw the legend as a boxed key inside the
+#      panel. ggplot2 >= 3.5.0 uses legend.position.inside; earlier
+#      versions take the coordinates in legend.position. ----
+key_theme <- function(key_pos) {
+  pos_theme <- if (utils::packageVersion("ggplot2") >= "3.5.0") {
+    theme(legend.position = "inside", legend.position.inside = key_pos)
+  } else {
+    theme(legend.position = key_pos)
+  }
+  pos_theme +
+    theme(
+      legend.justification = key_pos,
+      legend.background = element_rect(colour = "black", fill = "white", linewidth = 0.4),
+      legend.margin = margin(3, 6, 3, 4),
+      legend.key = element_blank(),
+      legend.key.height = unit(14, "pt"),
+      legend.text = element_text(size = 11)
+    )
+}
+
+# ============================================================
+# ANALYSIS A: species comparison within each photoperiod
+# ============================================================
+run_within_photoperiod_analysis <- function(pd) {
+  sub_out <- file.path(output_dir, "within_photoperiod", pd)
+  if (!dir.exists(sub_out)) dir.create(sub_out, recursive = TRUE)
+
+  dat <- dat_all %>% filter(photoperiod == pd) %>% droplevels()
+  if (nrow(dat) == 0) {
+    warning("No data for photoperiod ", pd)
+    return(NULL)
+  }
+
+  write.csv(dat, file.path(sub_out, "01_cleaned_long_data.csv"), row.names = FALSE)
+
+  summary_df <- dat %>%
+    group_by(species, zt) %>%
+    summarise(
+      n = n(), mean = mean(expr, na.rm = TRUE), sd = sd(expr, na.rm = TRUE),
+      se = sd / sqrt(n), .groups = "drop"
+    )
+  write.csv(summary_df, file.path(sub_out, "02_summary_stats.csv"), row.names = FALSE)
+
+  core <- run_group_comparison_core(dat, "species", species_levels, sub_out)
+
+  # ---- Plot: individual samples, fitted curves, rhythmicity calls,
+  #      and a light/dark bar for this photoperiod ----
+  light_end <- light_end_by_pd[[pd]]
+  x_breaks <- sort(unique(dat$zt)); x_min <- min(x_breaks); x_max <- max(x_breaks)
+  y_max <- max(dat$expr, na.rm = TRUE)
+  y_axis_lower <- 0
+  # Light/dark bar size and position, scaled to the panel height so the
+  # bar sits the same distance below the axis in every plot.
+  # Top of the y-axis: highest data point or fitted value, plus space
+  # for the key.
+  y_top <- key_safe_ymax(max(c(y_max, core$predictions$fit), na.rm = TRUE), y_axis_lower)
+  panel_span <- y_top - y_axis_lower
+  bar_height <- 0.075 * panel_span
+  bar_offset <- 0.23 * panel_span
+  bar_ymax <- -bar_offset
+  bar_ymin <- bar_ymax - bar_height
+
+  photo_bar <- data.frame(
+    xmin = c(x_min - 0.5, light_end),
+    xmax = c(light_end, x_max + 0.5),
+    ymin = c(bar_ymin, bar_ymin),
+    ymax = c(bar_ymax, bar_ymax),
+    phase = c("Light", "Dark")
+  )
+
+  # Boxed key: italic species name followed by its rhythmicity call.
+  key_labels <- make_key_labels(species_levels, core$rhythmicity, italic_names = TRUE)
+  key_pos <- key_position
+
+  p <- ggplot(dat, aes(x = zt, y = expr, shape = species, colour = species)) +
+    { if (nrow(core$predictions) > 0) {
+      geom_line(
+        data = core$predictions, aes(x = zt, y = fit, group = group), inherit.aes = FALSE,
+        linetype = "dashed", linewidth = 0.9, colour = "gray35"
+      )
+    } } +
+    geom_point(position = position_jitter(width = 0.12, height = 0), size = 3) +
+    geom_rect(
+      data = photo_bar, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = phase),
+      inherit.aes = FALSE, color = "black", linewidth = 0.35
+    ) +
+    # Photoperiod label ("SD" or "LD") beside the light/dark bar
+    annotate(
+      "text", x = x_min - 0.6, y = (bar_ymin + bar_ymax) / 2, label = pd,
+      hjust = 1, size = bar_label_size, fontface = "bold"
+    ) +
+    scale_shape_manual(values = setNames(point_shapes, species_levels),
+                       breaks = species_levels, labels = key_labels) +
+    scale_colour_manual(values = setNames(point_colours, species_levels),
+                        breaks = species_levels, labels = key_labels) +
+    scale_fill_manual(values = c("Light" = "white", "Dark" = "gray25"), guide = "none") +
+    scale_x_continuous(breaks = x_breaks, labels = paste0("ZT", str_pad(x_breaks, width = 2, pad = "0"))) +
+    # Include the key space in the y scale so tick marks extend into it.
+    expand_limits(y = y_top) +
+    coord_cartesian(
+      xlim = c(x_min - 0.5, x_max + 0.5),
+      ylim = c(y_axis_lower, y_top),
+      clip = "off"
+    ) +
+    labs(
+      x = NULL, y = y_axis_label, shape = NULL, colour = NULL,
+      title = bquote(.(pd) * ":" ~ italic("Cx. pipiens") ~ "vs" ~ italic("Cx. quinquefasciatus"))
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.line = element_line(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      axis.text = element_text(colour = "black"),
+      axis.text.x = element_text(margin = margin(t = 6)),
+      plot.margin = margin(t = 12, r = 12, b = 60, l = 30)
+    ) +
+    key_theme(key_pos)
+
+  ggsave(file.path(sub_out, paste0("09_", pd, "_species_comparison_plot.png")), p, width = 8.5, height = 5.5, dpi = 600)
+  ggsave(file.path(sub_out, paste0("09_", pd, "_species_comparison_plot.pdf")), p, width = 8.5, height = 5.5)
+
+  c(list(photoperiod = pd, cleaned = dat, summary = summary_df), core)
+}
+
+within_pd_results <- lapply(photoperiod_levels, run_within_photoperiod_analysis)
+names(within_pd_results) <- photoperiod_levels
+
+# ============================================================
+# ANALYSIS B: photoperiod comparison within each species
+# ============================================================
+run_between_photoperiod_analysis <- function(sp) {
+  stub <- clean_label(sp)
+  sub_out <- file.path(output_dir, "between_photoperiod", stub)
+  if (!dir.exists(sub_out)) dir.create(sub_out, recursive = TRUE)
+
+  dat <- dat_all %>% filter(species == sp) %>% droplevels()
+  if (nrow(dat) == 0) {
+    warning("No data for species ", sp)
+    return(NULL)
+  }
+
+  write.csv(dat, file.path(sub_out, "01_cleaned_long_data.csv"), row.names = FALSE)
+
+  summary_df <- dat %>%
+    group_by(photoperiod, zt) %>%
+    summarise(
+      n = n(), mean = mean(expr, na.rm = TRUE), sd = sd(expr, na.rm = TRUE),
+      se = sd / sqrt(n), .groups = "drop"
+    )
+  write.csv(summary_df, file.path(sub_out, "02_summary_stats.csv"), row.names = FALSE)
+
+  core <- run_group_comparison_core(dat, "photoperiod", photoperiod_levels, sub_out)
+
+  # ---- Plot: individual samples, fitted curves, rhythmicity calls,
+  #      and stacked light/dark bars for SD (top) and LD (bottom) ----
+  x_breaks <- sort(unique(dat$zt)); x_min <- min(x_breaks); x_max <- max(x_breaks)
+  y_max <- max(dat$expr, na.rm = TRUE)
+  y_axis_lower <- 0
+  # Light/dark bar sizes and positions, scaled to the panel height so the
+  # bars sit the same distance below the axis in every plot.
+  # Top of the y-axis: highest data point or fitted value, plus space
+  # for the key.
+  y_top <- key_safe_ymax(max(c(y_max, core$predictions$fit), na.rm = TRUE), y_axis_lower)
+  panel_span <- y_top - y_axis_lower
+  bar_height <- 0.068 * panel_span
+  bar_gap <- 0.015 * panel_span
+  bar_offset <- 0.23 * panel_span
+
+  sd_end <- light_end_by_pd[["SD"]]
+  ld_end <- light_end_by_pd[["LD"]]
+  sd_bar_ymax <- -bar_offset
+  sd_bar_ymin <- sd_bar_ymax - bar_height
+  ld_bar_ymax <- sd_bar_ymin - bar_gap
+  ld_bar_ymin <- ld_bar_ymax - bar_height
+
+  photo_bar <- data.frame(
+    xmin = c(x_min - 0.5, sd_end, x_min - 0.5, ld_end),
+    xmax = c(sd_end, x_max + 0.5, ld_end, x_max + 0.5),
+    ymin = c(sd_bar_ymin, sd_bar_ymin, ld_bar_ymin, ld_bar_ymin),
+    ymax = c(sd_bar_ymax, sd_bar_ymax, ld_bar_ymax, ld_bar_ymax),
+    phase = c("Light", "Dark", "Light", "Dark")
+  )
+
+  # Boxed key: photoperiod followed by its rhythmicity call.
+  key_labels <- make_key_labels(photoperiod_levels, core$rhythmicity, italic_names = FALSE)
+  key_pos <- key_position
+
+  p <- ggplot(dat, aes(x = zt, y = expr, shape = photoperiod, colour = photoperiod)) +
+    { if (nrow(core$predictions) > 0) {
+      geom_line(
+        data = core$predictions, aes(x = zt, y = fit, group = group), inherit.aes = FALSE,
+        linetype = "dashed", linewidth = 0.9, colour = "gray35"
+      )
+    } } +
+    geom_point(position = position_jitter(width = 0.12, height = 0), size = 3) +
+    geom_rect(
+      data = photo_bar, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = phase),
+      inherit.aes = FALSE, color = "black", linewidth = 0.35
+    ) +
+    # Photoperiod labels beside each of the two light/dark bars
+    annotate("text", x = x_min - 0.6, y = (sd_bar_ymin + sd_bar_ymax) / 2, label = "SD",
+             hjust = 1, size = bar_label_size, fontface = "bold") +
+    annotate("text", x = x_min - 0.6, y = (ld_bar_ymin + ld_bar_ymax) / 2, label = "LD",
+             hjust = 1, size = bar_label_size, fontface = "bold") +
+    scale_shape_manual(values = setNames(point_shapes, photoperiod_levels),
+                       breaks = photoperiod_levels, labels = key_labels) +
+    scale_colour_manual(values = setNames(point_colours, photoperiod_levels),
+                        breaks = photoperiod_levels, labels = key_labels) +
+    scale_fill_manual(values = c("Light" = "white", "Dark" = "gray25"), guide = "none") +
+    scale_x_continuous(breaks = x_breaks, labels = paste0("ZT", str_pad(x_breaks, width = 2, pad = "0"))) +
+    # Include the key space in the y scale so tick marks extend into it.
+    expand_limits(y = y_top) +
+    coord_cartesian(
+      xlim = c(x_min - 0.5, x_max + 0.5),
+      ylim = c(y_axis_lower - 0.02 * panel_span, y_top),
+      clip = "off"
+    ) +
+    labs(
+      x = NULL, y = y_axis_label, shape = NULL, colour = NULL,
+      title = bquote(italic(.(sp)) * ": SD vs LD")
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.line = element_line(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      axis.text = element_text(colour = "black"),
+      axis.text.x = element_text(margin = margin(t = 6)),
+      plot.margin = margin(t = 12, r = 12, b = 80, l = 30)
+    ) +
+    key_theme(key_pos)
+
+  ggsave(file.path(sub_out, paste0("09_", stub, "_SD_vs_LD_plot.png")), p, width = 8.5, height = 5.5, dpi = 600)
+  ggsave(file.path(sub_out, paste0("09_", stub, "_SD_vs_LD_plot.pdf")), p, width = 8.5, height = 5.5)
+
+  c(list(species = sp, cleaned = dat, summary = summary_df), core)
+}
+
+between_pd_results <- lapply(species_levels, run_between_photoperiod_analysis)
+names(between_pd_results) <- species_levels
+
+# ============================================================
+# Compile all result tables into one workbook
+# ============================================================
+compiled <- list()
+
+for (pd in photoperiod_levels) {
+  r <- within_pd_results[[pd]]
+  if (is.null(r)) next
+  compiled[[paste0(pd, "_summary")]]      <- r$summary
+  compiled[[paste0(pd, "_circa_params")]] <- r$params
+  compiled[[paste0(pd, "_circacompare")]] <- r$circacompare_params
+  compiled[[paste0(pd, "_rhythmicity")]]  <- r$rhythmicity
+  if (!is.null(r$anova)) compiled[[paste0(pd, "_anova")]]    <- r$anova$anova
+  if (!is.null(r$anova)) compiled[[paste0(pd, "_pairwise")]] <- r$anova$pairwise
+}
+
+for (sp in species_levels) {
+  r <- between_pd_results[[sp]]
+  if (is.null(r)) next
+  stub <- ifelse(sp == "Cx. pipiens", "pip", "quin")
+  compiled[[paste0(stub, "_SDvsLD_summary")]]      <- r$summary
+  compiled[[paste0(stub, "_SDvsLD_circa_params")]] <- r$params
+  compiled[[paste0(stub, "_SDvsLD_circacompare")]] <- r$circacompare_params
+  compiled[[paste0(stub, "_SDvsLD_rhythmicity")]]  <- r$rhythmicity
+  if (!is.null(r$anova)) compiled[[paste0(stub, "_SDvsLD_anova")]]    <- r$anova$anova
+  if (!is.null(r$anova)) compiled[[paste0(stub, "_SDvsLD_pairwise")]] <- r$anova$pairwise
+}
+
+# Excel sheet names are limited to 31 characters.
+names(compiled) <- substr(names(compiled), 1, 31)
+writexl::write_xlsx(compiled, path = file.path(output_dir, "99_compiled_results_tables.xlsx"))
+
+# -----------------------------
+# Record circacompare function signatures (for reproducibility)
+# -----------------------------
+sink(file.path(output_dir, "98_session_diagnostics.txt"))
+cat("Package diagnostics\n\n")
+cat("circacompare namespace loaded: ", requireNamespace("circacompare", quietly = TRUE), "\n\n", sep = "")
+cat("args(circacompare::circa_single)\n")
+print(args(circacompare::circa_single))
+cat("\n\nargs(circacompare::circacompare)\n")
+print(args(circacompare::circacompare))
+sink()
+
+# -----------------------------
+# Summary of output locations
+# -----------------------------
+cat("\n====================\n")
+cat("ANALYSIS COMPLETE\n")
+cat("====================\n")
+cat("Output folder: ", output_dir, "\n\n", sep = "")
+cat("Within-photoperiod species comparisons:\n")
+cat("  ", output_dir, "/within_photoperiod/SD/\n", sep = "")
+cat("  ", output_dir, "/within_photoperiod/LD/\n", sep = "")
+cat("Between-photoperiod (SD vs LD) comparisons, per species:\n")
+cat("  ", output_dir, "/between_photoperiod/Cx_pipiens/\n", sep = "")
+cat("  ", output_dir, "/between_photoperiod/Cx_quinquefasciatus/\n", sep = "")
+cat("Each folder contains 00_analysis_decision_note.txt explaining whether\n")
+cat("the ANOVA fallback was triggered for that specific comparison.\n\n")
+cat("Compiled tables: 99_compiled_results_tables.xlsx\n")
+cat("Diagnostics: 98_session_diagnostics.txt\n")
+```
+

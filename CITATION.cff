@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the article and this repository."
+title: "Analysis code for: Diapause-Associated Divergence in Circadian Architecture Between Culex pipiens and Culex quinquefasciatus"
+type: software
+license: MIT
+authors:
+  - family-names: Geddes
+    given-names: Gavin
+    affiliation: "Department of Biology, Baylor University"
+  - family-names: Dhungana
+    given-names: Prabin
+    affiliation: "Department of Biology, Baylor University"
+  - family-names: Jhara
+    given-names: Moumita S.
+    affiliation: "Department of Biology, Baylor University"
+  - family-names: McKay
+    given-names: Kaylee
+    affiliation: "Department of Biology, Baylor University"
+  - family-names: Sim
+    given-names: Cheolho
+    affiliation: "Department of Biology, Baylor University"
+keywords:
+  - diapause
+  - circadian clock
+  - Culex pipiens
+  - Culex quinquefasciatus
+  - PDF

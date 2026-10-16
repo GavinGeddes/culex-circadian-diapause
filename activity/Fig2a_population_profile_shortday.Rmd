@@ -1,0 +1,318 @@
+---
+title: "Fig. 2a - Population activity profile, short day"
+author: "gavingeddes"
+date: "2025-12-18"
+output: html_document
+---
+```{r}
+# =========================================================
+# Population activity profile: Culex pipiens and
+# Culex quinquefasciatus, short-day (SD, 9L:15D) entrainment
+# followed by constant darkness (DD)
+#
+# Overview
+#   For each species, this script plots the proportion of
+#   individuals that were active in each 30-min bin across the
+#   whole recording: ld_days days of light/dark entrainment
+#   followed by constant darkness. An individual counts as active
+#   in a bin if it recorded at least one beam crossing (activity
+#   count > 0). Dark phases during entrainment and the whole DD
+#   period are shaded grey.
+#
+# Input
+#   Two TriKinetics monitor files of 30-min binned counts, one row
+#   per bin (pip_file, quin_file). Columns 11-42 hold activity
+#   channels 1-32 (one individual per channel). Time is counted
+#   from the first row of the file, which is assumed to be 00:00
+#   clock time, so light_on / light_off give the lights-on and
+#   lights-off times within each day.
+#
+# Output
+#   FigA_population_activity_SD_30min_LD3_DD3_propMoving_rawcols11to42_excl.png
+#   (two panels, one per species; 7 x 5 in, 600 dpi)
+#
+# Requirements
+#   R with tidyverse.
+# =========================================================
+
+library(tidyverse)
+
+# =========================================================
+# SETTINGS
+# =========================================================
+bin_minutes <- 30   # bin length of the input files (min)
+
+# SD entrainment, 9L:15D: lights on 08:00, lights off 17:00
+# (decimal hours)
+light_on  <- 8.0
+light_off <- 17.0
+
+# Number of light/dark days at the start of the recording; all
+# later days are constant darkness (DD).
+ld_days <- 3
+
+# Input files (30-min bins)
+pip_file  <- "pipiens_SD_30min.txt.txt"
+quin_file <- "quinque_SD_30min.txt.txt"
+
+# Activity columns in the monitor file: column 11 = channel
+# (individual) 1, ..., column 42 = channel 32
+raw_act_col_min <- 11
+raw_act_col_max <- 42
+
+# Channels (individuals, 1-32) excluded from each species;
+# integer(0) means none are excluded.
+EXCLUDE_PIP  <- integer(0)
+EXCLUDE_QUIN <- c(6, 13)
+
+# Species label (panel strip) font size, in pt. 14.4 pt matches the
+# species titles of the average daily activity profiles
+# (ggplot2 title size at theme_classic(base_size = 12)).
+SPECIES_LABEL_SIZE_PT <- 14.4
+
+# Italic species labels for the panel strips (plotmath italic()).
+species_strip_labeller <- as_labeller(
+  c("Cx. pipiens"          = "italic('Cx. pipiens')",
+    "Cx. quinquefasciatus" = "italic('Cx. quinquefasciatus')"),
+  default = label_parsed
+)
+
+# =========================================================
+# READ A MONITOR FILE AND COMPUTE THE PROPORTION MOVING
+# Reads one 30-min binned TriKinetics monitor file, removes
+# excluded channels, and returns for each time bin the number of
+# active individuals (count > 0), the number scored, and the
+# proportion active (prop_moving). time_days is the time since the
+# first row, in days.
+# =========================================================
+read_lam_ct <- function(path, species_label,
+                        bin_minutes = 30,
+                        raw_act_col_min = 11,
+                        raw_act_col_max = 42,
+                        exclude_individuals = integer(0)) {
+
+  raw <- readr::read_tsv(
+    file = path,
+    col_names = FALSE,
+    show_col_types = FALSE,
+    progress = FALSE
+  )
+
+  orig_ncol <- ncol(raw)
+
+  if (orig_ncol < raw_act_col_max) {
+    stop(
+      species_label, ": file has only ", orig_ncol,
+      " columns, but raw_act_col_max = ", raw_act_col_max, "."
+    )
+  }
+
+  # Locate the column containing the "Ct" (counts) data-type code;
+  # reported in the console message as a check of the file layout.
+  ct_col <- which(purrr::map_lgl(raw, ~ any(.x == "Ct", na.rm = TRUE)))[1]
+  if (is.na(ct_col)) stop("Could not find 'Ct' column in: ", path)
+
+  # Activity columns for channels 1-32
+  act_cols_idx   <- raw_act_col_min:raw_act_col_max
+  act_cols_names <- names(raw)[act_cols_idx]
+
+  raw <- raw %>%
+    mutate(
+      species   = species_label,
+      row_id    = row_number(),
+      time_days = (row_id - 1) * (bin_minutes / 60) / 24
+    )
+
+  long <- raw %>%
+    pivot_longer(
+      cols = all_of(act_cols_names),
+      names_to = "channel",
+      values_to = "activity"
+    ) %>%
+    mutate(
+      raw_col    = as.integer(stringr::str_remove(channel, "^X")),
+      individual = raw_col - raw_act_col_min + 1,
+      activity   = suppressWarnings(as.numeric(activity)),
+      moving     = if_else(!is.na(activity) & activity > 0, 1L, 0L)
+    )
+
+  # Check that columns map to individuals 1-32
+  indiv_found <- sort(unique(long$individual))
+  if (!identical(indiv_found, 1:32)) {
+    warning(
+      species_label,
+      ": expected mapped individuals 1:32, but found ",
+      paste(indiv_found, collapse = ", ")
+    )
+  }
+
+  # Remove excluded individuals
+  if (length(exclude_individuals) > 0) {
+    long <- long %>%
+      filter(!individual %in% exclude_individuals)
+  }
+
+  n_individuals_used <- n_distinct(long$individual)
+
+  message(
+    species_label,
+    " | Ct column detected at raw file column ", ct_col,
+    " | raw activity cols used: ", raw_act_col_min, ":", raw_act_col_max,
+    " | individuals used: ", n_individuals_used,
+    " | excluded individuals: ",
+    ifelse(length(exclude_individuals) == 0,
+           "none",
+           paste(exclude_individuals, collapse = ","))
+  )
+
+  if (n_individuals_used == 0) {
+    stop("No individuals left after filtering for: ", species_label)
+  }
+
+  # Proportion of individuals active in each time bin
+  long %>%
+    group_by(species, time_days) %>%
+    summarise(
+      n_moving    = sum(moving, na.rm = TRUE),
+      n_scored    = sum(!is.na(moving)),
+      prop_moving = n_moving / n_scored,
+      .groups = "drop"
+    ) %>%
+    arrange(species, time_days)
+}
+
+# =========================================================
+# READ BOTH SPECIES
+# =========================================================
+pop_avg <- bind_rows(
+  read_lam_ct(
+    path = pip_file,
+    species_label = "Cx. pipiens",
+    bin_minutes = bin_minutes,
+    raw_act_col_min = raw_act_col_min,
+    raw_act_col_max = raw_act_col_max,
+    exclude_individuals = EXCLUDE_PIP
+  ),
+  read_lam_ct(
+    path = quin_file,
+    species_label = "Cx. quinquefasciatus",
+    bin_minutes = bin_minutes,
+    raw_act_col_min = raw_act_col_min,
+    raw_act_col_max = raw_act_col_max,
+    exclude_individuals = EXCLUDE_QUIN
+  )
+)
+
+# Number of individuals scored per species (denominator of the
+# proportion)
+pop_avg %>%
+  distinct(species, n_scored) %>%
+  print(n = Inf)
+
+# =========================================================
+# DARK-PHASE SHADING
+# shade_ld: dark phases of each light/dark day (before lights-on
+# and after lights-off); shade_dd: the whole DD period.
+# =========================================================
+min_day <- floor(min(pop_avg$time_days))
+max_day <- ceiling(max(pop_avg$time_days))
+
+shade_ld <- tibble(
+  day = seq(min_day, min(ld_days, max_day) - 1, by = 1)
+) %>%
+  mutate(
+    xmin = day,
+    xmax = day + 1,
+    light_start = day + light_on / 24,
+    light_end   = day + light_off / 24
+  )
+
+shade_dd <- tibble(
+  xmin = ld_days,
+  xmax = max_day
+) %>%
+  filter(xmax > xmin)
+
+# =========================================================
+# PLOT
+# One panel per species: proportion of population moving over
+# time, with dark phases and DD shaded grey.
+# =========================================================
+p <- ggplot() +
+
+  # DD period
+  geom_rect(
+    data = shade_dd,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+    fill = "grey85",
+    inherit.aes = FALSE
+  ) +
+
+  # Dark phase before lights-on (LD days)
+  geom_rect(
+    data = shade_ld,
+    aes(xmin = xmin, xmax = light_start, ymin = -Inf, ymax = Inf),
+    fill = "grey85",
+    inherit.aes = FALSE
+  ) +
+
+  # Dark phase after lights-off (LD days)
+  geom_rect(
+    data = shade_ld,
+    aes(xmin = light_end, xmax = xmax, ymin = -Inf, ymax = Inf),
+    fill = "grey85",
+    inherit.aes = FALSE
+  ) +
+
+  geom_line(
+    data = pop_avg,
+    aes(x = time_days, y = prop_moving, color = species),
+    linewidth = 0.8
+  ) +
+
+  facet_wrap(~ species, ncol = 1, labeller = species_strip_labeller) +
+
+  scale_color_manual(values = c(
+    "Cx. pipiens" = "#3B82B8",
+    "Cx. quinquefasciatus" = "#C65A1E"
+  )) +
+
+  scale_x_continuous(
+    breaks = seq(min_day, max_day, by = 1),
+    minor_breaks = NULL,
+    expand = c(0, 0)
+  ) +
+
+  coord_cartesian(ylim = c(0, 1)) +
+
+  labs(
+    x = "Time (days)",
+    y = "Proportion of population moving"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = SPECIES_LABEL_SIZE_PT),
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks.length = unit(0.15, "cm")
+  )
+
+print(p)
+
+# =========================================================
+# SAVE
+# =========================================================
+ggsave(
+  "FigA_population_activity_SD_30min_LD3_DD3_propMoving_rawcols11to42_excl.png",
+  p,
+  width = 7,
+  height = 5,
+  dpi = 600
+)
+```
+
+
+

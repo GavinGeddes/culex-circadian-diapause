@@ -1,0 +1,159 @@
+---
+title: "Fig. 3 - Visual inspection of peak calls"
+author: "gavingeddes"
+date: "2026-07-12"
+output: html_document
+---
+```{r}
+# ============================================================
+# Per-individual diagnostic plots used to verify M- and E-peak
+# calls by eye (one PDF page per channel).
+#
+# PREREQUISITE: run Fig3_FigS2_activity_peaks.Rmd first, in the
+# same R session. This script reuses its settings (input files,
+# exclusions, lights-on/off times, DD_DAYS, loess_span, ma_k,
+# half_window_h) and functions (get_va_curves(), find_va_peaks(),
+# select_va_peak_in_window(), ch_to_abscol()).
+#
+# Output: review_Cxpip_SD.pdf, review_Cxquin_SD.pdf,
+#         review_Cxpip_LD.pdf, review_Cxquin_LD.pdf
+# ============================================================
+library(tidyverse)
+library(zoo)
+
+# ---- Rebuild the per-channel averaged (raw, unsmoothed) DD profile
+# for every channel in one file at once (same logic as
+# extract_phase_offsets(), factored out here for reuse across all
+# channels in a single pass rather than one file-read per channel). ----
+build_all_channel_profiles <- function(file_path, exclude_ch) {
+  raw <- readr::read_tsv(file_path, show_col_types = FALSE)
+  exclude_abs <- ch_to_abscol(exclude_ch)
+  keep_abs    <- setdiff(activity_start_col:activity_end_col, exclude_abs)
+
+  act <- raw %>%
+    select(all_of(names(raw)[keep_abs])) %>%
+    mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+  n_min      <- nrow(act)
+  total_days <- ceiling(n_min / 1440)
+  dd_start   <- total_days - DD_DAYS + 1
+  dd_end     <- total_days
+
+  long_full <- act %>%
+    mutate(t_min = row_number() - 1, day = floor(t_min / 1440) + 1, tod = (t_min %% 1440) / 60) %>%
+    pivot_longer(-c(t_min, day, tod), names_to = "colname", values_to = "activity") %>%
+    mutate(abscol = match(colname, names(raw)), channel = abscol - activity_start_col + 1)
+
+  dd_raw <- long_full %>% filter(day >= dd_start, day <= dd_end)
+
+  dd_raw %>%
+    group_by(channel, tod) %>%
+    summarise(activity_mean = mean(activity, na.rm = TRUE), .groups = "drop") %>%
+    arrange(channel, tod)
+}
+
+# ---- Build one diagnostic ggplot for a single individual. Shows the
+# raw activity trace (grey bars) against the moving-average curve
+# (navy) -- these are the two curves actually intersected by
+# find_va_peaks() per Vaze et al. The loess curve (dotted grey) is
+# shown only as smoothing context, since it feeds the moving-average
+# curve but is not itself one of the two intersected curves. ----
+plot_channel_diagnostic <- function(tod, activity, LON, LOFF, halfwidth,
+                                     channel_label, span = loess_span, k = ma_k) {
+  curve <- get_va_curves(tod, activity, span, k) %>%
+    filter(t >= 24, t < 48) %>%
+    mutate(tod = t - 24)
+
+  va_peaks <- find_va_peaks(tod, activity, span, k)
+  M_sel <- select_va_peak_in_window(va_peaks, LON,  halfwidth)
+  E_sel <- select_va_peak_in_window(va_peaks, LOFF, halfwidth)
+
+  sel_points <- bind_rows(
+    if (!is.na(M_sel$tod)) tibble(tod = M_sel$tod, y = M_sel$y_cross, label = "M") else NULL,
+    if (!is.na(E_sel$tod)) tibble(tod = E_sel$tod, y = E_sel$y_cross, label = "E") else NULL
+  )
+  if (nrow(sel_points) == 0) sel_points <- tibble(tod = numeric(0), y = numeric(0), label = character(0))
+
+  other_peaks <- if (nrow(va_peaks) > 0 && nrow(sel_points) > 0) {
+    va_peaks %>% filter(!(tod %in% sel_points$tod))
+  } else {
+    va_peaks
+  }
+
+  raw_df <- tibble(tod = tod, activity = activity)
+
+  p <- ggplot() +
+    geom_col(data = raw_df, aes(x = tod, y = activity), fill = "grey70", width = 1/60) +
+    annotate("rect", xmin = LON - halfwidth, xmax = LON + halfwidth,
+             ymin = -Inf, ymax = Inf, alpha = 0.08, fill = "orange") +
+    annotate("rect", xmin = LOFF - halfwidth, xmax = LOFF + halfwidth,
+             ymin = -Inf, ymax = Inf, alpha = 0.08, fill = "blue") +
+    geom_vline(xintercept = LON,  linetype = "dashed", color = "orange3") +
+    geom_vline(xintercept = LOFF, linetype = "dashed", color = "blue3") +
+    # Loess curve: shown as context (thin, muted) -- it feeds the
+    # moving-average curve below but is NOT itself one of the two
+    # curves being intersected.
+    geom_line(data = curve, aes(x = tod, y = loess_y), color = "grey40",
+              linewidth = 0.5, linetype = "dotted") +
+    # Moving-average curve: THIS is the curve intersected against the
+    # raw activity bars above, per Vaze et al. ("the curve generated
+    # by moving average" vs. "the original activity data").
+    geom_line(data = curve, aes(x = tod, y = ma_y), color = "navy", linewidth = 0.9)
+
+  if (nrow(other_peaks) > 0) {
+    p <- p + geom_point(data = other_peaks, aes(x = tod, y = y_cross),
+                         color = "grey40", size = 1.5, shape = 1)
+  }
+  if (nrow(sel_points) > 0) {
+    p <- p +
+      geom_point(data = sel_points, aes(x = tod, y = y), color = "red", size = 3) +
+      geom_text(data = sel_points, aes(x = tod, y = y, label = label), color = "red",
+                vjust = -1, fontface = "bold", size = 4)
+  }
+
+  p +
+    scale_x_continuous(limits = c(0, 24), breaks = seq(0, 24, 4)) +
+    labs(title = channel_label,
+         subtitle = sprintf("has_M_peak = %s   has_E_peak = %s   (grey bars = raw activity, navy = moving-avg curve [intersected against raw], dotted grey = loess reference)",
+                             !is.na(M_sel$tod), !is.na(E_sel$tod)),
+         x = "Time of day (h)", y = "Activity") +
+    theme_classic() +
+    theme(plot.subtitle = element_text(size = 8, color = "grey30"))
+}
+
+# ---- Generate a multi-page PDF, one page per channel, for one file.
+# `channels = NULL` (default) reviews every channel, matching Vaze et
+# al.'s practice of checking every individual's actogram, not just
+# algorithmically-flagged ones. Pass a vector (e.g. from your
+# needs_review output) to review only specific channels instead. ----
+generate_review_pdf <- function(file_path, exclude_ch, LON, LOFF, species, photoperiod,
+                                 output_pdf, channels = NULL) {
+  profiles <- build_all_channel_profiles(file_path, exclude_ch)
+  ch_list <- if (is.null(channels)) sort(unique(profiles$channel)) else sort(unique(channels))
+
+  pdf(output_pdf, width = 8, height = 5)
+  for (ch in ch_list) {
+    sub <- profiles %>% filter(channel == ch)
+    if (nrow(sub) == 0) next
+    p <- plot_channel_diagnostic(
+      sub$tod, sub$activity_mean, LON, LOFF, half_window_h,
+      channel_label = sprintf("%s %s -- channel %d", species, photoperiod, ch)
+    )
+    print(p)
+  }
+  dev.off()
+
+  message("Saved ", length(ch_list), " diagnostic pages to ", output_pdf)
+}
+
+# ============================================================
+# RUN -- one PDF per species x photoperiod group, all channels.
+# Swap in `channels = needs_review %>% filter(...) %>% pull(channel)`
+# per group if you'd rather triage the flagged ones first.
+# ============================================================
+generate_review_pdf(pip_SD_file,  pip_SD_exclude_ch,  SD_LON, SD_LOFF, "Cxpip",  "SD", "review_Cxpip_SD.pdf")
+generate_review_pdf(quin_SD_file, quin_SD_exclude_ch, SD_LON, SD_LOFF, "Cxquin", "SD", "review_Cxquin_SD.pdf")
+generate_review_pdf(pip_LD_file,  pip_LD_exclude_ch,  LD_LON, LD_LOFF, "Cxpip",  "LD", "review_Cxpip_LD.pdf")
+generate_review_pdf(quin_LD_file, quin_LD_exclude_ch, LD_LON, LD_LOFF, "Cxquin", "LD", "review_Cxquin_LD.pdf")
+```
+

@@ -1,0 +1,212 @@
+---
+title: "Fig. 6 and Fig. S5 - PDF immunoreactivity (short day)"
+author: "gavingeddes"
+date: "2026-06-30"
+output: html_document
+---
+```{r}
+# =============================================================================
+# PDF Immunoreactivity — SHORT-DAY species comparison  (Cx. pipiens vs Cx. quinquefasciatus)
+#
+# ANALYSIS: Welch's two-sample t-test on BRAIN-AVERAGED values.
+#   - The two hemispheres of each brain are averaged to one value per brain
+#     (the unit of biological replication), which removes pseudoreplication
+#     without needing a mixed model.
+#   - Area and CTCF are natural-log transformed prior to testing (variance
+#     scaled with the mean; see Methods); differences back-transform to
+#     fold-changes. Mean intensity is analyzed on the raw scale.
+#   - Welch's t-test does not assume equal variance between species.
+#   - Run at threshold 100 (primary) and 75 & 150 (supplemental) to show the
+#     result is robust to threshold choice.
+#
+# INPUT : IHC_long.csv  (96 rows)
+# OUTPUT: tables (Welch results, group means, threshold sensitivity) + figures
+#         Figures now show significance via a bracket + asterisks (*, **, ***, ns)
+#         connecting the two bars, instead of a printed "p = ..." value.
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+
+# ---- load & prepare ---------------------------------------------------------
+df <- read.csv("IHC_long.csv", stringsAsFactors = FALSE)
+names(df) <- trimws(names(df))
+
+df$species     <- factor(df$species,     levels = c("pipiens","quinquefasciatus"))
+df$photoperiod <- factor(df$photoperiod, levels = c("SD","LD"))
+df$brain_id    <- factor(df$brain_id)
+df$threshold   <- factor(df$threshold,   levels = c("75","100","150"))
+
+if (!"log_area" %in% names(df) || any(is.na(df$log_area))) df$log_area <- log(df$area)
+if (!"log_CTCF" %in% names(df) || any(is.na(df$log_CTCF))) df$log_CTCF <- log(df$CTCF)
+
+species_lab <- function(x) factor(ifelse(x=="pipiens","Cx. pipiens","Cx. quinquefasciatus"),
+                                  levels = c("Cx. pipiens","Cx. quinquefasciatus"))
+
+# metric registry: key, analysis column (log for area/CTCF), logged?, axis label, title
+metrics <- list(
+  list(key="area_um2",       col="log_area",       logged=TRUE,  ylab="PDF+ arborization area (um^2)", title="PDF+ arborization area"),
+  list(key="CTCF",           col="log_CTCF",       logged=TRUE,  ylab="CTCF (a.u.)",                    title="CTCF"),
+  list(key="mean_intensity", col="mean_intensity", logged=FALSE, ylab="Mean intensity (a.u.)",          title="PDF+ mean intensity")
+)
+
+# =============================================================================
+# CORE: for one threshold, Welch test + brain-level group means, all metrics
+# =============================================================================
+analyze_threshold <- function(thr) {
+  d <- df %>% filter(photoperiod=="SD", threshold==thr) %>% droplevels()
+  stopifnot(nrow(d) == 16)
+
+  welch_rows <- list(); mean_rows <- list()
+
+  for (m in metrics) {
+    col <- m$col
+
+    # ---- brain-averaged values (unit of replication) ----
+    bl <- d %>% group_by(brain_id, species) %>%
+      summarise(value = mean(.data[[col]]), .groups="drop")
+
+    vp <- bl$value[bl$species=="pipiens"]
+    vq <- bl$value[bl$species=="quinquefasciatus"]
+
+    # ---- Welch's t-test ----
+    tt <- t.test(vp, vq, var.equal = FALSE)
+
+    if (m$logged) {
+      est   <- exp(mean(vp) - mean(vq))          # pip/quin ratio (fold-change)
+      ci_lo <- exp(tt$conf.int[1]); ci_hi <- exp(tt$conf.int[2])
+      elab  <- "fold-change (pip/quin)"
+    } else {
+      est   <- mean(vp) - mean(vq)               # difference
+      ci_lo <- tt$conf.int[1]; ci_hi <- tt$conf.int[2]
+      elab  <- "difference (pip - quin)"
+    }
+
+    welch_rows[[m$key]] <- data.frame(
+      threshold=thr, metric=m$key,
+      estimate=round(est,3), CI_low=round(ci_lo,3), CI_high=round(ci_hi,3),
+      t=round(tt$statistic,3), df=round(tt$parameter,2),
+      p_value=signif(tt$p.value,3), effect=elab, stringsAsFactors=FALSE)
+
+    # ---- brain-level group means (match the figure): mean +/- 1 SE (n=4) ----
+    gm <- bl %>% group_by(species) %>%
+      summarise(mlog = mean(value), se = sd(value)/sqrt(n()), .groups="drop") %>%
+      mutate(estimate = if (m$logged) exp(mlog)      else mlog,
+             lo       = if (m$logged) exp(mlog - se) else mlog - se,
+             hi       = if (m$logged) exp(mlog + se) else mlog + se)
+
+    mean_rows[[m$key]] <- data.frame(
+      threshold=thr, metric=m$key, species=as.character(gm$species),
+      estimate=round(gm$estimate,2),
+      SE_band_low=round(gm$lo,2), SE_band_high=round(gm$hi,2),
+      note=if(m$logged)"geometric mean, +/-1 SE (n=4 brains)" else "mean, +/-1 SE (n=4 brains)",
+      stringsAsFactors=FALSE)
+  }
+
+  list(welch=bind_rows(welch_rows), means=bind_rows(mean_rows), data=d)
+}
+
+results <- lapply(c("75","100","150"), analyze_threshold)
+names(results) <- c("75","100","150")
+
+welch_all <- bind_rows(lapply(results, `[[`, "welch"))
+means_all <- bind_rows(lapply(results, `[[`, "means"))
+
+# =============================================================================
+# STATISTICS TABLES
+# =============================================================================
+write.csv(welch_all, "SD_stats_welch.csv", row.names=FALSE)
+write.csv(means_all, "SD_stats_group_means.csv", row.names=FALSE)
+
+# threshold-sensitivity view: effect + p for each metric across thresholds
+sens_tbl <- welch_all %>%
+  select(metric, threshold, estimate, CI_low, CI_high, p_value) %>%
+  arrange(metric, threshold)
+write.csv(sens_tbl, "SD_stats_threshold_sensitivity.csv", row.names=FALSE)
+
+cat("\n===================== WELCH t-TEST (brain-averaged) =====================\n")
+print(welch_all, row.names=FALSE)
+cat("\n===================== GROUP MEANS (brain-level, match figures) ==========\n")
+print(means_all, row.names=FALSE)
+cat("\n===================== THRESHOLD SENSITIVITY =============================\n")
+print(sens_tbl, row.names=FALSE)
+
+# =============================================================================
+# FIGURES — one bar plot per metric per threshold
+#   bar     = group mean (geometric for area/CTCF; arithmetic for intensity)
+#   error   = +/- 1 SE from the 4 brain values (back-transformed for logged)
+#   points  = individual brains (n = 4 per species)
+#   bracket = significance bracket connecting the two bars, labeled with
+#             asterisks (* p<0.05, ** p<0.01, *** p<0.001, ns = not significant)
+#             in place of a printed p-value
+# =============================================================================
+th_plot <- theme_classic(base_size = 13) +
+  theme(legend.position="none",
+        axis.text=element_text(color="black"),
+        axis.text.x=element_text(face="italic"),
+        plot.title=element_text(face="bold"),
+        plot.subtitle=element_text(color="grey30"))
+
+sp_cols <- c("Cx. pipiens"="#3B82B8", "Cx. quinquefasciatus"="#C65A1E")
+
+# convert a p-value to conventional significance stars
+get_stars <- function(p) {
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  return("ns")
+}
+
+make_barplot <- function(d, m, thr, welch_p) {
+  col <- m$col
+
+  pts <- d %>% group_by(brain_id, species) %>%
+    summarise(val = if (m$logged) exp(mean(.data[[col]])) else mean(.data[[col]]),
+              logmean = mean(.data[[col]]), .groups="drop") %>%
+    mutate(species_lab = species_lab(species))
+
+  gs <- pts %>% group_by(species) %>%
+    summarise(mlog = mean(logmean), se = sd(logmean)/sqrt(n()), .groups="drop") %>%
+    mutate(species_lab = species_lab(species),
+           est = if (m$logged) exp(mlog)      else mlog,
+           lo  = if (m$logged) exp(mlog - se) else mlog - se,
+           hi  = if (m$logged) exp(mlog + se) else mlog + se)
+
+  # headroom for the bracket + stars above the tallest point
+  data_top    <- max(pts$val)
+  plot_top    <- data_top * 1.38
+  bracket_y   <- data_top * 1.12   # horizontal bar of the bracket
+  tick_drop   <- data_top * 0.04   # length of the little downward ticks
+  star_y      <- bracket_y + data_top * 0.11  # more clearance above the bracket
+
+  stars <- get_stars(welch_p)
+
+  ggplot(gs, aes(species_lab, est, fill=species_lab)) +
+    geom_col(width=0.6, color="black") +
+    geom_errorbar(aes(ymin=lo, ymax=hi), width=0.18) +
+    geom_jitter(data=pts, aes(species_lab, val),
+                width=0.10, height=0, size=2.6, shape=21, fill="white", color="black") +
+    # significance bracket: two downward ticks + connecting horizontal line
+    annotate("segment", x=1, xend=1, y=bracket_y - tick_drop, yend=bracket_y) +
+    annotate("segment", x=2, xend=2, y=bracket_y - tick_drop, yend=bracket_y) +
+    annotate("segment", x=1, xend=2, y=bracket_y, yend=bracket_y) +
+    annotate("text", x=1.5, y=star_y, label=stars, size=5, fontface="bold") +
+    scale_fill_manual(values=sp_cols) +
+    coord_cartesian(ylim=c(0, plot_top)) +
+    labs(title=m$title, subtitle=paste0("short day, threshold ", thr),
+         x=NULL, y=m$ylab) + th_plot
+}
+
+for (thr in c("75","100","150")) {
+  d  <- results[[thr]]$data
+  wp <- results[[thr]]$welch
+  for (m in metrics) {
+    p <- make_barplot(d, m, thr, wp$p_value[wp$metric==m$key])
+    ggsave(paste0("SD_", m$key, "_thr", thr, ".png"), p, width=4.2, height=4.2, dpi=300)
+  }
+}
+
+cat("\nSaved figures: SD_<metric>_thr<75|100|150>.png  (9 total)\n")
+cat("Saved tables : SD_stats_welch.csv, SD_stats_group_means.csv, SD_stats_threshold_sensitivity.csv\n")
+```
+

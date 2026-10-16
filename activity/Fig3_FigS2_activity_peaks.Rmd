@@ -1,0 +1,1465 @@
+---
+title: "Fig. 3 and Fig. S2 - Morning and evening activity peaks"
+author: "gavingeddes"
+date: "2026-07-03"
+output: html_document
+---
+```{r}
+# ============================================================
+# Morning (M) and evening (E) activity peaks under constant
+# darkness (DD): Culex pipiens and Culex quinquefasciatus entrained
+# to short-day (SD, 9L:15D) or long-day (LD, 15L:9D) photoperiods
+#
+# Overview
+#   For each individual, this script detects the M-peak (near the
+#   entrainment lights-on time) and the E-peak (near the entrainment
+#   lights-off time) in its average DD activity profile, and then
+#   compares groups in a 2 x 2 design (species x entrainment
+#   photoperiod) on:
+#     - the E-to-M peak interval,
+#     - the deviation of that interval from the entrained dark-phase
+#       length (15 h for SD, 9 h for LD),
+#     - the E-peak phase relative to entrainment lights-off, and
+#     - the proportion of individuals with a detected M- or E-peak.
+#
+# Peak detection (adapted from Vaze et al. 2023, J Comp Physiol A)
+#   1. Average each individual's activity at each minute of the day
+#      over the last DD_DAYS days of the recording.
+#   2. Double-plot the 24 h profile (concatenate it with itself to
+#      give a 48 h trace) so that peaks near midnight are not
+#      truncated.
+#   3. Smooth the doubled trace by local regression (loess, span =
+#      loess_span).
+#   4. Apply a centered moving average (ma_k points) to the loess
+#      curve.
+#   5. Find the points where the unsmoothed activity crosses the
+#      moving-average curve from above to below; these crossings are
+#      candidate peaks. Only crossings in the second copy of the
+#      double plot (hours 24-48) are kept and converted back to time
+#      of day (0-24 h).
+#   6. Assign the M-peak and E-peak as the candidate inside a window
+#      of +/- half_window_h hours around the entrainment lights-on
+#      and lights-off times, respectively. If several candidates fall
+#      in a window, the one with the higher value on the
+#      moving-average curve is kept.
+#
+#   Window definition: Vaze et al. classify peaks by the first or
+#   second half of the light phase. Here a fixed window of equal
+#   width around lights-on and lights-off is used instead, because
+#   (a) the assay is in DD, so there is no light phase to divide, and
+#   (b) half-photophase windows would be 4.5 h wide for SD but 7.5 h
+#   wide for LD, giving the two photoperiods unequal search widths.
+#
+# Manual verification
+#   Individuals lacking a detected M- or E-peak, and individuals whose
+#   E-to-M interval is shorter than EM_min_interval_h, are listed for
+#   visual review of their activity traces. Reviewed channels are
+#   entered in the rescue/exclude lists (see MANUAL VERIFICATION
+#   section): a rescued peak is re-extracted with the same method
+#   (or, if no crossing exists in the window, taken as the maximum of
+#   the loess curve in the window); an excluded peak is set to "not
+#   detected". All statistics, exports and plots use the corrected
+#   table.
+#
+# Statistical analysis
+#   For each continuous variable, a linear model (species x
+#   photoperiod) is fitted and its residuals tested with the
+#   Shapiro-Wilk test (alpha = 0.05):
+#     - normal residuals: two-way ANOVA (Type II) on the raw scale;
+#     - non-normal, strictly positive variable, and normal residuals
+#       after log transformation: two-way ANOVA on the log scale;
+#     - otherwise: Aligned Rank Transform (ART) ANOVA with ART-C
+#       contrasts (ARTool package).
+#   Pairwise comparisons among the four groups are Holm-adjusted
+#   across all six comparisons; the two species comparisons within
+#   each photoperiod are then extracted for reporting and plotting.
+#
+#   M-peak phase is not analyzed as a separate outcome because
+#   M-peak detection was markedly lower in Cx. pipiens SD (58.6%)
+#   than in the other three groups (83.3-100%); a phase comparison
+#   would rest on a reduced, non-random subset of that group. E-peak
+#   detection showed no comparable group-specific loss.
+#
+#   Peak detection rates are compared with Fisher's exact tests
+#   (overall across the four groups, then all six pairs with Holm
+#   adjustment). Odds ratios are the odds of detection in group1
+#   relative to group2.
+#
+# Input
+#   Four TriKinetics monitor files (1-min bins, one header row), set
+#   in INPUT FILES. Columns 11-42 hold activity channels 1-32. The
+#   last DD_DAYS days of each recording are analyzed as DD.
+#
+# Output (written to the working directory)
+#   all_indiv_manually_corrected.csv        per-individual peak times
+#                                            and derived variables
+#   peak_detection_rate_summary.csv          detection counts and %
+#   peak_detection_rate_wilson_CI.csv        detection % with 95% CI
+#   peak_detection_fisher_test.csv           overall Fisher's tests
+#   peak_detection_pairwise_full6_global.csv pairwise Fisher's tests
+#   peak_detection_within_photoperiod_extracted.csv
+#   threshold_logging_summary.csv            peaks at the window edge
+#   EM_interval_group_estimates.csv          interval means and 95% CI
+#   shapiro_wilk_results_all_variables.csv
+#   omnibus_test_results_all_variables.csv
+#   phase_interval_pairwise_full6_global.csv
+#   phase_interval_within_photoperiod_extracted.csv
+#   phase_interval_statistics_adaptive.csv
+#   Fig_EM_interval_*.png, Fig_EM_interval_deviation_*.png,
+#   Fig_E_phase_*.png, Fig_peak_detection_rate_SDvsLD.png
+#
+# Requirements
+#   R with tidyverse, zoo, car, ARTool, emmeans and ragg. Species
+#   names are italicized with plotmath, and figures are saved with
+#   the ragg device so that italic fonts render reliably.
+#
+# References
+#   Vaze KM et al. (2023). J Comp Physiol A (peak detection method).
+#   Wobbrock JO, Findlater L, Gergle D, Higgins JJ (2011). The
+#     aligned rank transform for nonparametric factorial analyses
+#     using only ANOVA procedures. Proc. ACM CHI 2011, 143-146.
+#   Elkin LA, Kay M, Higgins JJ, Wobbrock JO (2021). An aligned
+#     rank transform procedure for multifactor contrast tests.
+#     Proc. ACM UIST 2021, 754-768.
+# ============================================================
+
+# Install ARTool and ragg if they are missing.
+for (pkg in c("ARTool", "ragg")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+library(tidyverse)
+library(zoo)
+library(car)      # for Anova(type = "II"), parametric path only
+library(ARTool)   # for art() / anova.art() / art.con()
+library(emmeans)  # for model-based contrasts on the parametric path
+library(ragg)     # reliable italic font rendering in saved PNGs
+
+# ============================================================
+# INPUT FILES (1-min raw)
+# ============================================================
+pip_SD_file  <- "pipiens_SD.txt"
+quin_SD_file <- "quinque_SD.txt"
+
+pip_LD_file  <- "pipiens_LD.txt"
+quin_LD_file <- "quinque_LD.txt"
+
+# ============================================================
+# ENTRAINMENT LIGHTS-ON / LIGHTS-OFF TIMES (decimal hours)
+# Used in DD as the reference times for the M- and E-peak windows.
+# ============================================================
+SD_LON  <- 8           # 9L:15D entrainment (lights on 8:00)
+SD_LOFF <- 17          # lights off 17:00
+LD_LON  <- 6 + 3/60    # 15L:9D entrainment (lights on 6:03am)
+LD_LOFF <- 21 + 3/60   # lights off 9:03pm
+
+# ============================================================
+# ACTIVITY COLUMN LAYOUT
+# File columns 11-42 hold activity channels 1-32 (one individual
+# per channel).
+# ============================================================
+activity_start_col <- 11
+activity_end_col   <- 42
+
+# Channels (1-32) excluded from each group before analysis.
+pip_SD_exclude_ch  <- c(1,3,7)
+quin_SD_exclude_ch <- c()
+pip_LD_exclude_ch  <- c(8,15,16,26)
+quin_LD_exclude_ch <- c(2,6,10,17,19)
+
+# ============================================================
+# DD SETTINGS
+# ============================================================
+DD_DAYS <- 3  # number of days at the end of each recording analyzed as DD
+
+# ============================================================
+# PEAK DETECTION SETTINGS
+# half_window_h: half-width (h) of the M- and E-peak search windows
+#   around lights-on and lights-off; the same for SD and LD.
+# loess_span / ma_k: loess smoothing span and moving-average window
+#   length (points) of the peak detection method.
+# ============================================================
+half_window_h <- 3
+loess_span    <- 0.02
+ma_k          <- 11   # moving-average window over the loess curve; MUST be odd
+if (ma_k %% 2 == 0) stop("ma_k must be odd for a symmetric centered moving average.")
+
+# Minimum plausible E-to-M interval (h); shorter intervals are set
+# to NA and listed for review.
+EM_min_interval_h <- 6
+
+# Dark-phase length during entrainment (h), used as the expected
+# E-to-M interval.
+expected_interval_h <- c(SD = 15, LD = 9)
+
+# ============================================================
+# HELPERS
+# ============================================================
+# Wrap times to 0-24 h, or to -12 to +12 h (for phase differences).
+wrap24 <- function(x) x %% 24
+wrap12 <- function(x) ((x + 12) %% 24) - 12
+# Convert a channel number to its file column.
+ch_to_abscol <- function(ch) activity_start_col + ch - 1
+
+# TRUE for times of day within +/- halfwidth of center, wrapping
+# across midnight.
+in_centered_window <- function(tod, center, halfwidth) {
+  start <- center - halfwidth
+  end   <- center + halfwidth
+  if (start < 0 || end >= 24) {
+    start <- wrap24(start); end <- wrap24(end)
+    (tod >= start) | (tod <= end)
+  } else {
+    (tod >= start) & (tod <= end)
+  }
+}
+
+# Convert a p-value to a significance label.
+sig_stars <- function(p) {
+  case_when(
+    is.na(p)    ~ "NA",
+    p <= 0.0001 ~ "****",
+    p <= 0.001  ~ "***",
+    p <= 0.01   ~ "**",
+    p <= 0.05   ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+# Line segments for vertical significance brackets (one per panel)
+# on the horizontal box plots.
+make_bracket_segments <- function(bracket_df, x_col = "x_pos", tick = NULL) {
+  if (is.null(tick)) tick <- 0.03 * max(abs(bracket_df[[x_col]]), na.rm = TRUE)
+  bind_rows(
+    bracket_df %>% transmute(photoperiod, x = .data[[x_col]], xend = .data[[x_col]], y = 1, yend = 2),
+    bracket_df %>% transmute(photoperiod, x = .data[[x_col]] - tick, xend = .data[[x_col]], y = 1, yend = 1),
+    bracket_df %>% transmute(photoperiod, x = .data[[x_col]] - tick, xend = .data[[x_col]], y = 2, yend = 2)
+  )
+}
+
+# From the six pairwise comparisons, keep the two species
+# comparisons within the same photoperiod.
+extract_within_photoperiod <- function(full6_df, label) {
+  purrr::map_dfr(c("LD", "SD"), function(pp) {
+    g1 <- paste0("Cxquin_", pp); g2 <- paste0("Cxpip_", pp)
+    m <- full6_df %>% filter((group1 == g1 & group2 == g2) | (group1 == g2 & group2 == g1))
+    m %>% mutate(photoperiod = pp) %>% relocate(photoperiod, .after = comparison)
+  })
+}
+
+# Split an ARTool contrast label ("a,b - c,d") into species and
+# photoperiod for each side.
+parse_artool_contrast <- function(contrast_str) {
+  sides <- str_split(contrast_str, " - ", simplify = TRUE)
+  s1 <- str_split(trimws(sides[1]), ",", simplify = TRUE)
+  s2 <- str_split(trimws(sides[2]), ",", simplify = TRUE)
+  tibble(species1 = trimws(s1[1]), photoperiod1 = trimws(s1[2]),
+         species2 = trimws(s2[1]), photoperiod2 = trimws(s2[2]))
+}
+
+# ============================================================
+# PEAK DETECTION FUNCTIONS (see header for the method)
+# ============================================================
+# ---- Double-plot a 24 h profile (concatenate it with itself to give
+#      a 48 h trace). ----
+double_plot_profile <- function(tod, activity) {
+  ord <- order(tod)
+  tod <- tod[ord]; activity <- activity[ord]
+  tibble(
+    t        = c(tod, tod + 24),
+    activity = c(activity, activity)
+  )
+}
+
+# ---- Fit a loess curve to the doubled trace, evaluated at the same
+#      time points as the data. Returns t, the unsmoothed (doubled)
+#      activity and the loess value at each t. ----
+get_va_loess_curve <- function(tod, activity, span = loess_span) {
+  dp <- double_plot_profile(tod, activity)
+  fit <- loess(activity ~ t, data = dp, span = span, degree = 2)
+  loess_y <- as.numeric(predict(fit, newdata = data.frame(t = dp$t)))
+  tibble(t = dp$t, activity_raw = dp$activity, loess_y = loess_y)
+}
+
+# ---- Add the moving average of the loess curve (ma_y) on the same
+#      time points. The ends are padded with the first/last loess
+#      value so the output has the same length as the input. ----
+get_va_curves <- function(tod, activity, span = loess_span, k = ma_k) {
+  curve <- get_va_loess_curve(tod, activity, span)
+  pad <- (k - 1) / 2
+  loess_padded <- c(rep(curve$loess_y[1], pad), curve$loess_y,
+                    rep(curve$loess_y[length(curve$loess_y)], pad))
+  curve$ma_y <- as.numeric(zoo::rollmean(loess_padded, k = k, align = "center"))
+  curve
+}
+
+# ---- Find all candidate peaks: points where the unsmoothed activity
+#      crosses the moving-average curve from above to below. The
+#      crossing time is linearly interpolated between samples. Returns
+#      the time of day (from the 24-48 h copy) and the moving-average
+#      value at each crossing (y_cross, used only to choose between
+#      candidates in a window). ----
+find_va_peaks <- function(tod, activity, span = loess_span, k = ma_k) {
+  curve <- get_va_curves(tod, activity, span, k)
+  diff_y    <- curve$activity_raw - curve$ma_y
+  sign_diff <- sign(diff_y)
+  cross_idx <- which(diff(sign_diff) != 0)
+  if (length(cross_idx) == 0) {
+    return(tibble(tod = numeric(0), y_cross = numeric(0)))
+  }
+  crossings <- purrr::map_dfr(cross_idx, function(i) {
+    t1 <- curve$t[i];   t2 <- curve$t[i + 1]
+    d1 <- diff_y[i];    d2 <- diff_y[i + 1]
+    if (d1 == d2) return(NULL)  # guard against degenerate flat segments
+    frac    <- d1 / (d1 - d2)
+    t_cross <- t1 + frac * (t2 - t1)
+    y_cross <- curve$ma_y[i] + frac * (curve$ma_y[i + 1] - curve$ma_y[i])
+    tibble(
+      t_cross   = t_cross,
+      y_cross   = y_cross,
+      direction = if (d1 > 0 && d2 < 0) "peak" else if (d1 < 0 && d2 > 0) "trough" else "flat"
+    )
+  })
+  crossings %>%
+    filter(direction == "peak", t_cross >= 24, t_cross < 48) %>%
+    transmute(tod = t_cross - 24, y_cross)
+}
+
+# ---- Select the candidate peak inside the window (+/- halfwidth)
+#      around a reference time; if several qualify, keep the one with
+#      the highest y_cross. Returns NA if none. ----
+select_va_peak_in_window <- function(peaks_df, center_time, halfwidth) {
+  cand <- peaks_df %>% filter(in_centered_window(tod, center_time, halfwidth))
+  if (nrow(cand) == 0) {
+    return(tibble(tod = NA_real_, y_cross = NA_real_))
+  }
+  cand %>% arrange(desc(y_cross)) %>% slice(1)
+}
+
+# ---- Peak time for a manually rescued peak (confirmed by visual
+#      review): uses the same crossing method, or, if there is no
+#      crossing in the window, the time of the loess maximum within
+#      the window. ----
+peak_tod_max_only_va <- function(tod, activity, center_time, halfwidth,
+                                 span = loess_span, k = ma_k) {
+  va_peaks <- find_va_peaks(tod, activity, span, k)
+  sel <- select_va_peak_in_window(va_peaks, center_time, halfwidth)
+  if (!is.na(sel$tod)) return(tibble(tod = sel$tod))
+  curve <- get_va_loess_curve(tod, activity, span)
+  clean <- curve %>% filter(t >= 24, t < 48) %>% mutate(tod = t - 24)
+  sub   <- clean %>% filter(in_centered_window(tod, center_time, halfwidth))
+  if (nrow(sub) == 0) return(tibble(tod = NA_real_))
+  sub %>% filter(loess_y == max(loess_y)) %>% slice(1) %>%
+    transmute(tod)
+}
+
+# ============================================================
+# 2 x 2 STATISTICAL ANALYSIS (species x photoperiod)
+# Selects raw-scale ANOVA, log-scale ANOVA or ART from Shapiro-Wilk
+# tests on model residuals (see header). Returns the omnibus table,
+# all six Holm-adjusted pairwise comparisons, the within-photoperiod
+# species comparisons and the values used for plot brackets.
+# ============================================================
+analyze_2x2_adaptive <- function(df, value_col, label, alpha = 0.05) {
+  # Use only finite values (removes NA, NaN and Inf).
+  d <- df %>% filter(is.finite(.data[[value_col]]))
+  form <- as.formula(paste(value_col, "~ species * photoperiod"))
+  mod_raw <- lm(form, data = d)
+  sw_raw <- shapiro.test(residuals(mod_raw))
+
+  cat("\n====================================\n")
+  cat("Analyzing:", label, "\n")
+  cat("====================================\n")
+  cat("Shapiro-Wilk on RAW model residuals: W =", round(sw_raw$statistic, 4),
+      ", p =", round(sw_raw$p.value, 4), "\n")
+
+  shapiro_log <- list(attempted = FALSE)
+  can_log <- all(d[[value_col]] > 0, na.rm = TRUE)
+
+  descriptives <- d %>%
+    group_by(species, photoperiod) %>%
+    summarise(n = n(), mean = mean(.data[[value_col]], na.rm = TRUE),
+              sd = sd(.data[[value_col]], na.rm = TRUE), sem = sd / sqrt(n),
+              median = median(.data[[value_col]], na.rm = TRUE), .groups = "drop")
+  cat("\nDescriptive statistics:\n"); print(descriptives)
+
+  run_parametric <- function(data_used, col_used, scale_used) {
+    mod <- lm(as.formula(paste(col_used, "~ species * photoperiod")), data = data_used)
+    aov_tab <- car::Anova(mod, type = "II")
+    cat("\nTwo-way ANOVA (Type II SS, scale =", scale_used, "):\n"); print(aov_tab)
+
+    em <- emmeans::emmeans(mod, ~ species * photoperiod)
+    con <- emmeans::contrast(em, "pairwise", adjust = "holm")
+    con_summary <- as_tibble(summary(con))
+    cat("\nFull 6-way emmeans contrasts (Holm-corrected across all 6):\n"); print(con_summary)
+
+    posthoc_df <- con_summary %>%
+      separate(contrast, into = c("g1", "g2"), sep = " - ") %>%
+      transmute(comparison = label,
+                group1 = str_replace(trimws(g1), " ", "_"),
+                group2 = str_replace(trimws(g2), " ", "_"),
+                estimate, SE, df, t_value = t.ratio,
+                p_value = p.value, significance = sig_stars(p.value))
+
+    within <- extract_within_photoperiod(posthoc_df, label)
+    cat("\nWithin-photoperiod contrasts extracted from the globally-corrected 6-way family",
+        "-- this is what's plotted and reported):\n"); print(within)
+
+    bracket_df <- within %>% transmute(photoperiod, p_value)
+    subtitle_txt <- sprintf(
+      "ANOVA (%s scale, residuals normal) — species p=%.3g, photoperiod p=%.3g, interaction p=%.3g",
+      scale_used, aov_tab["species", "Pr(>F)"], aov_tab["photoperiod", "Pr(>F)"],
+      aov_tab["species:photoperiod", "Pr(>F)"])
+
+    list(path = "parametric", scale_used = scale_used, descriptives = descriptives,
+         omnibus_table = aov_tab, posthoc_df = posthoc_df, within_photoperiod_df = within,
+         bracket_df = bracket_df, subtitle = subtitle_txt)
+  }
+
+  run_art <- function() {
+    m <- art(form, data = d)
+    cat("\nARTool alignment diagnostic (summary.art; all values should be ~0):\n")
+    print(summary(m))
+    aov_tab <- anova(m)
+    cat("\nARTool omnibus ANOVA (Type III, the package default for ART):\n"); print(aov_tab)
+
+    con_raw <- art.con(m, "species:photoperiod", adjust = "none")
+    con_df <- as_tibble(summary(con_raw))
+    parsed <- purrr::map_dfr(con_df$contrast, parse_artool_contrast)
+    con_df <- bind_cols(con_df, parsed) %>%
+      mutate(p_holm6 = p.adjust(p.value, method = "holm"))
+
+    full6_export <- con_df %>%
+      transmute(comparison = label,
+                group1 = paste0(species1, "_", photoperiod1),
+                group2 = paste0(species2, "_", photoperiod2),
+                estimate, SE, df, t_value = t.ratio,
+                p_value = p_holm6, significance = sig_stars(p_holm6))
+    cat("\nFull 6-way ART-C contrasts via ARTool (Holm-corrected across all 6):\n")
+    print(full6_export)
+
+    within <- con_df %>% filter(photoperiod1 == photoperiod2) %>%
+      transmute(comparison = label, photoperiod = photoperiod1,
+                method = "ART-C (ARTool, dedicated per-contrast alignment)",
+                estimate, statistic = t.ratio, df, p_value = p_holm6,
+                significance = sig_stars(p_holm6))
+    cat("\nWithin-photoperiod contrasts extracted from the globally-corrected 6-way family",
+        "-- this is what's plotted and reported):\n"); print(within)
+
+    bracket_df <- within %>% transmute(photoperiod, p_value)
+    p_species <- aov_tab$`Pr(>F)`[aov_tab$Term == "species"]
+    p_photo   <- aov_tab$`Pr(>F)`[aov_tab$Term == "photoperiod"]
+    p_int     <- aov_tab$`Pr(>F)`[aov_tab$Term == "species:photoperiod"]
+    subtitle_txt <- sprintf(
+      "ART (ARTool, Type III, residuals non-normal) — species p=%.3g, photoperiod p=%.3g, interaction p=%.3g",
+      p_species, p_photo, p_int)
+
+    list(path = "nonparametric", scale_used = "raw (rank-based, ARTool)", descriptives = descriptives,
+         omnibus_table = aov_tab, art_c_df = full6_export, within_photoperiod_df = within,
+         bracket_df = bracket_df, subtitle = subtitle_txt)
+  }
+
+  if (sw_raw$p.value >= alpha) {
+    cat(" --> RAW NORMAL -> using ANOVA on raw scale.\n")
+    result <- run_parametric(d, value_col, "raw")
+  } else if (can_log) {
+    log_col <- paste0(value_col, "_log")
+    d[[log_col]] <- log(d[[value_col]])
+    mod_log <- lm(as.formula(paste(log_col, "~ species * photoperiod")), data = d)
+    sw_log <- shapiro.test(residuals(mod_log))
+    shapiro_log <- list(attempted = TRUE, W = unname(sw_log$statistic), p = sw_log$p.value)
+    cat("Shapiro-Wilk on LOG-transformed model residuals: W =", round(sw_log$statistic, 4),
+        ", p =", round(sw_log$p.value, 4), "\n")
+
+    if (sw_log$p.value >= alpha) {
+      cat(" --> RAW non-normal, LOG NORMAL -> using ANOVA on log scale.\n")
+      result <- run_parametric(d, log_col, "log")
+    } else {
+      cat(" --> RAW non-normal, LOG also non-normal -> using ART (ARTool).\n")
+      result <- run_art()
+    }
+  } else {
+    cat(" --> RAW non-normal; variable can be zero/negative so log-transform was NOT attempted -> using ART (ARTool).\n")
+    result <- run_art()
+  }
+
+  bracket_df <- result$bracket_df %>%
+    mutate(label = sig_stars(p_value), photoperiod = factor(photoperiod, levels = c("LD", "SD")))
+  result$bracket_df <- bracket_df
+  result$label <- label
+  result$value_col <- value_col
+  result$can_log <- can_log
+  result$shapiro_raw_W <- unname(sw_raw$statistic)
+  result$shapiro_raw_p <- sw_raw$p.value
+  result$shapiro_log <- shapiro_log
+
+  result
+}
+
+# ============================================================
+# PEAK DETECTION FOR ONE GROUP
+# Reads a monitor file, averages each individual's activity over the
+# DD window, detects the M- and E-peaks, and returns one row per
+# individual with peak times, the E-to-M interval, phases relative to
+# lights-on/off, and detection flags. Individuals lacking a peak or
+# with an implausibly short interval are printed for manual review.
+# ============================================================
+extract_phase_offsets <- function(file_path, species, exclude_ch,
+                                  LON, LOFF, photoperiod) {
+  raw <- readr::read_tsv(file_path, show_col_types = FALSE)
+  exclude_abs <- ch_to_abscol(exclude_ch)
+  keep_abs    <- setdiff(activity_start_col:activity_end_col, exclude_abs)
+
+  if (max(keep_abs) > ncol(raw)) {
+    stop(species, " (", photoperiod, "): file has ", ncol(raw),
+         " columns but you requested up to col ", max(keep_abs),
+         ". Fix activity_start_col/activity_end_col.")
+  }
+
+  act <- raw %>%
+    select(all_of(names(raw)[keep_abs])) %>%
+    mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+  n_min      <- nrow(act)
+  total_days <- ceiling(n_min / 1440)
+  dd_start   <- total_days - DD_DAYS + 1
+  dd_end     <- total_days
+
+  message(species, " (", photoperiod, "): inferred total_days=", total_days,
+          " | using DD days ", dd_start, "-", dd_end, " (last ", DD_DAYS, " days).")
+
+  long_full <- act %>%
+    mutate(t_min = row_number() - 1,
+           day   = floor(t_min / 1440) + 1,
+           tod   = (t_min %% 1440) / 60) %>%
+    pivot_longer(-c(t_min, day, tod), names_to = "colname", values_to = "activity") %>%
+    mutate(
+      abscol  = match(colname, names(raw)),
+      channel = abscol - activity_start_col + 1
+    )
+
+  dd_raw <- long_full %>% filter(day >= dd_start, day <= dd_end)
+
+  avg_raw_profile <- dd_raw %>%
+    group_by(channel, tod) %>%
+    summarise(activity_mean = mean(activity, na.rm = TRUE), .groups = "drop") %>%
+    arrange(channel, tod)
+
+  per_indiv <- avg_raw_profile %>%
+    group_by(channel) %>%
+    group_modify(~{
+      va_peaks <- find_va_peaks(.x$tod, .x$activity_mean)
+      M_sel <- select_va_peak_in_window(va_peaks, LON,  half_window_h)
+      E_sel <- select_va_peak_in_window(va_peaks, LOFF, half_window_h)
+
+      tibble(
+        M_peak_mean_tod  = M_sel$tod,
+        E_peak_mean_tod  = E_sel$tod
+      )
+    }) %>%
+    ungroup() %>%
+    mutate(
+      EM_interval_raw  = (M_peak_mean_tod - E_peak_mean_tod) %% 24,
+      EM_interval_mean = ifelse(is.na(EM_interval_raw) | EM_interval_raw < EM_min_interval_h,
+                                NA_real_, EM_interval_raw),
+      species     = species,
+      photoperiod = photoperiod,
+      M_phase_h   = wrap12(M_peak_mean_tod - LON),
+      E_phase_h   = wrap12(E_peak_mean_tod - LOFF),
+      has_M_peak  = !is.na(M_peak_mean_tod),
+      has_E_peak  = !is.na(E_peak_mean_tod)
+    )
+
+  needs_review <- per_indiv %>%
+    filter(!has_M_peak | !has_E_peak)
+
+  if (nrow(needs_review) > 0) {
+    cat("\n[", species, " ", photoperiod, "] NEEDS MANUAL REVIEW -- no intersection-",
+        "defined peak found by the double-plot/loess/moving-average-vs-original method within the ",
+        "+/-", half_window_h, "h window. This (has_M_peak/has_E_peak == FALSE), not the ",
+        "EM-interval floor below, is the PRIMARY trigger for populating the rescue/",
+        "exclude lists in the manual verification layer:\n", sep = "")
+    print(needs_review %>% select(channel, has_M_peak, has_E_peak, M_peak_mean_tod, E_peak_mean_tod))
+  } else {
+    cat("\n[", species, " ", photoperiod, "] All individuals have both peaks detected.\n", sep = "")
+  }
+
+  short_interval_flag <- per_indiv %>%
+    filter(!is.na(EM_interval_raw) & EM_interval_raw < EM_min_interval_h)
+
+  if (nrow(short_interval_flag) > 0) {
+    cat("\n[", species, " ", photoperiod, "] SECONDARY CHECK -- both M and E peaks WERE ",
+        "detected, but the resulting interval is implausibly short (<", EM_min_interval_h,
+        "h), suggesting a possible mislabeled/spurious peak even though the algorithm ",
+        "reported success. Worth a visual check, but this is a secondary flag, not the ",
+        "primary review trigger:\n", sep = "")
+    print(short_interval_flag %>% select(channel, M_peak_mean_tod, E_peak_mean_tod, EM_interval_raw))
+  }
+
+  message(species, " (", photoperiod, "): individuals kept = ", nrow(per_indiv),
+          " | channels kept = ", paste(sort(per_indiv$channel), collapse = ", "))
+
+  cat("\n[", species, " ", photoperiod, "] Peak detection outcome per individual",
+      " (based on the single averaged 24h profile, not per-day):\n", sep = "")
+  print(per_indiv %>% select(channel, has_M_peak, has_E_peak))
+
+  per_indiv
+}
+
+# ============================================================
+# RUN PEAK DETECTION FOR ALL FOUR GROUPS
+# ============================================================
+pip_SD_indiv  <- extract_phase_offsets(pip_SD_file,  "Cxpip",  pip_SD_exclude_ch,
+                                       SD_LON, SD_LOFF, "SD")
+quin_SD_indiv <- extract_phase_offsets(quin_SD_file, "Cxquin", quin_SD_exclude_ch,
+                                       SD_LON, SD_LOFF, "SD")
+pip_LD_indiv  <- extract_phase_offsets(pip_LD_file,  "Cxpip",  pip_LD_exclude_ch,
+                                       LD_LON, LD_LOFF, "LD")
+quin_LD_indiv <- extract_phase_offsets(quin_LD_file, "Cxquin", quin_LD_exclude_ch,
+                                       LD_LON, LD_LOFF, "LD")
+
+all_indiv <- bind_rows(pip_SD_indiv, quin_SD_indiv, pip_LD_indiv, quin_LD_indiv) %>%
+  mutate(
+    species     = factor(species,     levels = c("Cxquin", "Cxpip")),
+    photoperiod = factor(photoperiod, levels = c("LD", "SD")),
+    expected_interval_h = expected_interval_h[as.character(photoperiod)],
+    interval_deviation  = EM_interval_mean - expected_interval_h
+  )
+
+print(all_indiv %>% count(species, photoperiod))
+
+# ============================================================
+# MANUAL VERIFICATION
+# ============================================================
+# Settings (file, excluded channels, lights-on/off) for each group,
+# used to re-extract rescued peaks.
+group_config <- tribble(
+  ~species,  ~photoperiod, ~file,          ~exclude_ch,          ~LON,    ~LOFF,
+  "Cxpip",   "SD",         pip_SD_file,    pip_SD_exclude_ch,    SD_LON,  SD_LOFF,
+  "Cxquin",  "SD",         quin_SD_file,   quin_SD_exclude_ch,   SD_LON,  SD_LOFF,
+  "Cxpip",   "LD",         pip_LD_file,    pip_LD_exclude_ch,    LD_LON,  LD_LOFF,
+  "Cxquin",  "LD",         quin_LD_file,   quin_LD_exclude_ch,   LD_LON,  LD_LOFF
+)
+
+# ---- Results of visual review of flagged individuals (activity
+#      trace with its moving-average curve), by channel number:
+#        *_exclude_M / *_exclude_E: no genuine peak; the peak is set
+#          to "not detected" (manual_call = "flat").
+#        *_rescue_M / *_rescue_E: genuine peak missed by the
+#          algorithm; the peak time is re-extracted
+#          (manual_call = "real_peak"). ----
+Cxpip_SD_exclude_M <- c(27)
+Cxpip_SD_rescue_M  <- c()
+Cxpip_SD_exclude_E <- c()
+Cxpip_SD_rescue_E  <- c()
+
+Cxquin_SD_exclude_M <- c(1,2)
+Cxquin_SD_rescue_M  <- c()
+Cxquin_SD_exclude_E <- c()
+Cxquin_SD_rescue_E  <- c()
+
+Cxpip_LD_exclude_M <- c()
+Cxpip_LD_rescue_M  <- c()
+Cxpip_LD_exclude_E <- c()
+Cxpip_LD_rescue_E  <- c()
+
+Cxquin_LD_exclude_M <- c()
+Cxquin_LD_rescue_M  <- c()
+Cxquin_LD_exclude_E <- c()
+Cxquin_LD_rescue_E  <- c()
+
+# Combine the lists above into one table of manual calls.
+make_calls <- function(species, photoperiod, channels, peak_type, call) {
+  if (length(channels) == 0) return(NULL)
+  tibble(species = species, photoperiod = photoperiod,
+         channel = as.double(channels), peak_type = peak_type, manual_call = call)
+}
+
+manual_calls <- bind_rows(
+  make_calls("Cxpip",  "SD", Cxpip_SD_exclude_M,  "M", "flat"),
+  make_calls("Cxpip",  "SD", Cxpip_SD_rescue_M,   "M", "real_peak"),
+  make_calls("Cxpip",  "SD", Cxpip_SD_exclude_E,  "E", "flat"),
+  make_calls("Cxpip",  "SD", Cxpip_SD_rescue_E,   "E", "real_peak"),
+  make_calls("Cxquin", "SD", Cxquin_SD_exclude_M, "M", "flat"),
+  make_calls("Cxquin", "SD", Cxquin_SD_rescue_M,  "M", "real_peak"),
+  make_calls("Cxquin", "SD", Cxquin_SD_exclude_E, "E", "flat"),
+  make_calls("Cxquin", "SD", Cxquin_SD_rescue_E,  "E", "real_peak"),
+  make_calls("Cxpip",  "LD", Cxpip_LD_exclude_M,  "M", "flat"),
+  make_calls("Cxpip",  "LD", Cxpip_LD_rescue_M,   "M", "real_peak"),
+  make_calls("Cxpip",  "LD", Cxpip_LD_exclude_E,  "E", "flat"),
+  make_calls("Cxpip",  "LD", Cxpip_LD_rescue_E,   "E", "real_peak"),
+  make_calls("Cxquin", "LD", Cxquin_LD_exclude_M, "M", "flat"),
+  make_calls("Cxquin", "LD", Cxquin_LD_rescue_M,  "M", "real_peak"),
+  make_calls("Cxquin", "LD", Cxquin_LD_exclude_E, "E", "flat"),
+  make_calls("Cxquin", "LD", Cxquin_LD_rescue_E,  "E", "real_peak")
+)
+
+if (is.null(manual_calls) || !("channel" %in% names(manual_calls)) || nrow(manual_calls) == 0) {
+  manual_calls <- tibble(
+    species = character(), photoperiod = character(), channel = double(),
+    peak_type = character(), manual_call = character()
+  )
+}
+
+manual_calls <- manual_calls %>%
+  mutate(species = as.character(species), photoperiod = as.character(photoperiod),
+         channel = as.double(channel), peak_type = as.character(peak_type),
+         manual_call = as.character(manual_call))
+
+cat("\nmanual_calls currently has", nrow(manual_calls), "row(s).\n")
+
+# ---- Average DD activity profile (unsmoothed) for one channel, used
+#      to re-extract a rescued peak. ----
+build_single_channel_profile <- function(file_path, exclude_ch, channel_of_interest) {
+  raw <- readr::read_tsv(file_path, show_col_types = FALSE)
+  exclude_abs <- ch_to_abscol(exclude_ch)
+  keep_abs    <- setdiff(activity_start_col:activity_end_col, exclude_abs)
+
+  act <- raw %>%
+    select(all_of(names(raw)[keep_abs])) %>%
+    mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+  n_min      <- nrow(act)
+  total_days <- ceiling(n_min / 1440)
+  dd_start   <- total_days - DD_DAYS + 1
+  dd_end     <- total_days
+
+  long_full <- act %>%
+    mutate(t_min = row_number() - 1, day = floor(t_min / 1440) + 1, tod = (t_min %% 1440) / 60) %>%
+    pivot_longer(-c(t_min, day, tod), names_to = "colname", values_to = "activity") %>%
+    mutate(abscol = match(colname, names(raw)), channel = abscol - activity_start_col + 1) %>%
+    filter(channel == channel_of_interest)
+
+  dd_raw <- long_full %>% filter(day >= dd_start, day <= dd_end)
+
+  dd_raw %>%
+    group_by(tod) %>%
+    summarise(activity_mean = mean(activity, na.rm = TRUE), .groups = "drop") %>%
+    arrange(tod)
+}
+
+get_rescued_peak <- function(sp, pp, ch, center_time, halfwidth) {
+  cfg <- group_config %>% filter(species == sp, photoperiod == pp)
+  profile <- build_single_channel_profile(cfg$file[[1]], cfg$exclude_ch[[1]], ch)
+  peak_tod_max_only_va(profile$tod, profile$activity_mean, center_time, halfwidth)
+}
+
+# ---- Apply the manual calls and recompute the E-to-M interval and
+#      its deviation from the expected interval. ----
+apply_manual_calls <- function(all_indiv, manual_calls, group_config) {
+  result <- all_indiv
+
+  if (nrow(manual_calls) == 0) {
+    cat("No manual calls -- returning all_indiv unchanged.\n")
+    return(result)
+  }
+
+  for (i in seq_len(nrow(manual_calls))) {
+    ov <- manual_calls[i, ]
+
+    row_idx <- which(result$species == ov$species & result$photoperiod == ov$photoperiod &
+                       result$channel == ov$channel)
+
+    if (length(row_idx) == 0) {
+      warning("Manual call did not match any individual and was skipped: species=",
+              ov$species, ", photoperiod=", ov$photoperiod, ", channel=", ov$channel,
+              ", peak_type=", ov$peak_type, ", call=", ov$manual_call,
+              ". Check for a typo in the variable name, a channel already present in ",
+              "the exclude_ch list (removed before extraction, so it can never match here), ",
+              "or a species/photoperiod spelling mismatch.")
+      next
+    }
+
+    cfg <- group_config %>% filter(species == ov$species, photoperiod == ov$photoperiod)
+    center <- if (ov$peak_type == "M") cfg$LON else cfg$LOFF
+
+    if (ov$manual_call == "real_peak") {
+      rescued <- get_rescued_peak(ov$species, ov$photoperiod, ov$channel, center, half_window_h)
+      new_tod <- rescued$tod
+
+      if (ov$peak_type == "M") {
+        result$M_peak_mean_tod[row_idx] <- new_tod
+        result$has_M_peak[row_idx] <- !is.na(new_tod)
+        result$M_phase_h[row_idx] <- wrap12(new_tod - cfg$LON)
+      } else {
+        result$E_peak_mean_tod[row_idx] <- new_tod
+        result$has_E_peak[row_idx] <- !is.na(new_tod)
+        result$E_phase_h[row_idx] <- wrap12(new_tod - cfg$LOFF)
+      }
+    } else if (ov$manual_call == "flat") {
+      if (ov$peak_type == "M") {
+        result$M_peak_mean_tod[row_idx] <- NA_real_
+        result$has_M_peak[row_idx] <- FALSE
+        result$M_phase_h[row_idx] <- NA_real_
+      } else {
+        result$E_peak_mean_tod[row_idx] <- NA_real_
+        result$has_E_peak[row_idx] <- FALSE
+        result$E_phase_h[row_idx] <- NA_real_
+      }
+    }
+  }
+
+  result <- result %>%
+    mutate(
+      EM_interval_raw = (M_peak_mean_tod - E_peak_mean_tod) %% 24,
+      EM_interval_mean = ifelse(is.na(EM_interval_raw) | EM_interval_raw < EM_min_interval_h,
+                                NA_real_, EM_interval_raw),
+      expected_interval_h = expected_interval_h[as.character(photoperiod)],
+      interval_deviation = EM_interval_mean - expected_interval_h
+    )
+
+  result
+}
+
+all_indiv_corrected <- apply_manual_calls(all_indiv, manual_calls, group_config)
+
+cat("\n=== Manual correction summary: algorithm vs. corrected (peaks DETECTED) ===\n")
+bind_rows(
+  all_indiv %>% group_by(species, photoperiod) %>%
+    summarise(n_total = n(), n_M_detected = sum(has_M_peak), n_E_detected = sum(has_E_peak),
+              .groups = "drop") %>%
+    mutate(stage = "algorithm only"),
+  all_indiv_corrected %>% group_by(species, photoperiod) %>%
+    summarise(n_total = n(), n_M_detected = sum(has_M_peak), n_E_detected = sum(has_E_peak),
+              .groups = "drop") %>%
+    mutate(stage = "after manual review")
+) %>% arrange(species, photoperiod, stage) %>% print()
+
+write.csv(all_indiv_corrected, "all_indiv_manually_corrected.csv", row.names = FALSE)
+
+all_indiv <- all_indiv_corrected
+
+# ============================================================
+# PEAK DETECTION RATE SUMMARY (after manual verification)
+# Detection rate = % of individuals in which a peak was detected.
+# ============================================================
+peak_detection_summary <- all_indiv %>%
+  group_by(species, photoperiod) %>%
+  summarise(
+    n_total        = n(),
+    n_M_detected   = sum(has_M_peak),
+    n_E_detected   = sum(has_E_peak),
+    pct_M_detected = round(100 * n_M_detected / n_total, 1),
+    pct_E_detected = round(100 * n_E_detected / n_total, 1),
+    .groups = "drop"
+  )
+
+cat("\n====================================\n")
+cat("Peak detection rate by group (AFTER manual review; peaks detected via ",
+    "double-plot + loess [span = ", loess_span, "] + ", ma_k,
+    "-point moving-average vs. original-activity intersection, within a fixed +/-",
+    half_window_h, "h window around subjective LON/LOFF)\n", sep = "")
+cat("====================================\n")
+print(peak_detection_summary)
+
+write.csv(peak_detection_summary, "peak_detection_rate_summary.csv", row.names = FALSE)
+
+# ============================================================
+# PEAKS AT THE WINDOW EDGE (after manual verification)
+# ============================================================
+# Number and % of individuals whose M- or E-peak lies at the edge of
+# its search window (|phase| = half_window_h). Reported only; no
+# individuals are excluded.
+threshold_tol <- 1e-6
+threshold_log <- all_indiv %>%
+  mutate(
+    M_at_threshold = !is.na(M_phase_h) & (abs(M_phase_h) >= half_window_h - threshold_tol),
+    E_at_threshold = !is.na(E_phase_h) & (abs(E_phase_h) >= half_window_h - threshold_tol)
+  ) %>%
+  group_by(species, photoperiod) %>%
+  summarise(
+    n_total_individuals     = n(),
+    n_M_at_or_beyond_thresh = sum(M_at_threshold),
+    n_E_at_or_beyond_thresh = sum(E_at_threshold),
+    pct_M_at_or_beyond      = round(100 * n_M_at_or_beyond_thresh / n_total_individuals, 1),
+    pct_E_at_or_beyond      = round(100 * n_E_at_or_beyond_thresh / n_total_individuals, 1),
+    .groups = "drop"
+  )
+
+cat("\n====================================\n")
+cat("Threshold logging summary (+/-", half_window_h, "h window; no individuals excluded)\n")
+cat("====================================\n")
+print(threshold_log)
+
+write.csv(threshold_log, "threshold_logging_summary.csv", row.names = FALSE)
+
+# ============================================================
+# STATISTICAL ANALYSIS: E-to-M interval, its deviation from the
+# expected interval, and E-peak phase (M-peak phase is not analyzed;
+# see header).
+# ============================================================
+res_int <- analyze_2x2_adaptive(all_indiv, "EM_interval_mean",    "EM_interval")
+res_dev <- analyze_2x2_adaptive(all_indiv, "interval_deviation",  "EM_interval_deviation")
+
+# E-peak phase: E_phase_h = E-peak time minus entrainment lights-off
+# time (h), wrapped to -12 to +12 h.
+res_e <- analyze_2x2_adaptive(all_indiv, "E_phase_h", "E_peak_phase")
+
+all_results <- list(EM_interval = res_int, EM_interval_deviation = res_dev,
+                    E_peak_phase = res_e)
+
+# ============================================================
+# E-TO-M INTERVAL: GROUP ESTIMATES
+# Mean, SD, SEM, 95% CI and median of the E-to-M interval and its
+# deviation from the expected interval, per species x photoperiod.
+# ============================================================
+interval_group_summary <- bind_rows(
+  all_indiv %>%
+    filter(!is.na(EM_interval_mean)) %>%
+    group_by(species, photoperiod) %>%
+    summarise(
+      variable = "EM_interval_mean (hours)",
+      n        = n(),
+      mean     = mean(EM_interval_mean),
+      sd       = sd(EM_interval_mean),
+      sem      = sd / sqrt(n),
+      ci_lower = mean - qt(0.975, df = n - 1) * sem,
+      ci_upper = mean + qt(0.975, df = n - 1) * sem,
+      median   = median(EM_interval_mean),
+      .groups  = "drop"
+    ),
+  all_indiv %>%
+    filter(!is.na(interval_deviation)) %>%
+    group_by(species, photoperiod) %>%
+    summarise(
+      variable = "interval_deviation (hours from expected dark length)",
+      n        = n(),
+      mean     = mean(interval_deviation),
+      sd       = sd(interval_deviation),
+      sem      = sd / sqrt(n),
+      ci_lower = mean - qt(0.975, df = n - 1) * sem,
+      ci_upper = mean + qt(0.975, df = n - 1) * sem,
+      median   = median(interval_deviation),
+      .groups  = "drop"
+    )
+) %>%
+  mutate(across(c(mean, sd, sem, ci_lower, ci_upper, median), ~ round(.x, 3))) %>%
+  relocate(variable, .before = species)
+
+cat("\n====================================\n")
+cat("INTERVAL GROUP-LEVEL ESTIMATES (primary comparison of interest)\n")
+cat("====================================\n")
+print(interval_group_summary, n = Inf)
+
+write.csv(interval_group_summary, "EM_interval_group_estimates.csv", row.names = FALSE)
+
+cat("\nQuick-reference (EM_interval_mean, hours ± SEM):\n")
+interval_group_summary %>%
+  filter(variable == "EM_interval_mean (hours)") %>%
+  mutate(label = sprintf("%s %s: %.2f ± %.2f h (95%% CI [%.2f, %.2f]), n=%d",
+                         species, photoperiod, mean, sem, ci_lower, ci_upper, n)) %>%
+  pull(label) %>%
+  walk(cat, "\n")
+
+# ============================================================
+# EXPORT: Shapiro-Wilk results
+# ============================================================
+shapiro_results_export <- purrr::imap_dfr(all_results, function(res, nm) {
+  rows <- tibble(
+    variable  = nm,
+    scale_tested = "raw",
+    can_log   = res$can_log,
+    shapiro_W = res$shapiro_raw_W,
+    shapiro_p = res$shapiro_raw_p,
+    normal    = res$shapiro_raw_p >= 0.05
+  )
+
+  if (isTRUE(res$shapiro_log$attempted)) {
+    rows <- bind_rows(rows, tibble(
+      variable = nm, scale_tested = "log", can_log = res$can_log,
+      shapiro_W = res$shapiro_log$W, shapiro_p = res$shapiro_log$p,
+      normal = res$shapiro_log$p >= 0.05
+    ))
+  }
+
+  rows %>% mutate(final_path = res$path, final_scale_used = res$scale_used)
+})
+
+cat("\n====================================\n")
+cat("Shapiro-Wilk results (raw and log attempts where applicable), all variables\n")
+cat("====================================\n")
+print(shapiro_results_export)
+
+write.csv(shapiro_results_export, "shapiro_wilk_results_all_variables.csv", row.names = FALSE)
+
+# ============================================================
+# EXPORT: omnibus test tables
+# ============================================================
+tidy_omnibus <- function(res, nm) {
+  if (res$path == "parametric") {
+    tab <- res$omnibus_table
+    as_tibble(tab, rownames = "term") %>%
+      filter(term != "Residuals") %>%
+      transmute(
+        variable = nm, test_used = paste0("Two-way ANOVA (Type II, ", res$scale_used, " scale)"), term,
+        sum_sq = `Sum Sq`, df = Df, statistic_name = "F", statistic_value = `F value`,
+        p_value = `Pr(>F)`
+      )
+  } else {
+    tab <- res$omnibus_table
+    as_tibble(tab) %>%
+      transmute(
+        variable = nm, test_used = "ART (ARTool, Type III)", term = Term,
+        sum_sq = `Sum Sq`, df = Df, statistic_name = "F", statistic_value = `F value`,
+        p_value = `Pr(>F)`
+      )
+  }
+}
+
+omnibus_results_export <- purrr::imap_dfr(all_results, tidy_omnibus)
+
+cat("\n====================================\n")
+cat("Full omnibus test results (ANOVA or ARTool ART), all variables\n")
+cat("====================================\n")
+print(omnibus_results_export)
+
+write.csv(omnibus_results_export, "omnibus_test_results_all_variables.csv", row.names = FALSE)
+
+# ============================================================
+# EXPORT: pairwise comparisons (all six, and the within-photoperiod
+# species comparisons) and a one-row summary per variable
+# ============================================================
+posthoc_export <- bind_rows(
+  if (res_int$path == "parametric") res_int$posthoc_df else res_int$art_c_df,
+  if (res_dev$path == "parametric") res_dev$posthoc_df else res_dev$art_c_df,
+  if (res_e$path   == "parametric") res_e$posthoc_df   else res_e$art_c_df
+)
+
+write.csv(posthoc_export, "phase_interval_pairwise_full6_global.csv", row.names = FALSE)
+cat("\nSaved (the globally-corrected full 6-way family): phase_interval_pairwise_full6_global.csv\n")
+
+within_photoperiod_export <- bind_rows(
+  res_int$within_photoperiod_df, res_dev$within_photoperiod_df, res_e$within_photoperiod_df
+)
+
+cat("\n====================================\n")
+cat("Within-photoperiod contrasts extracted from the globally-corrected 6-way family\n")
+cat("====================================\n")
+print(within_photoperiod_export)
+
+write.csv(within_photoperiod_export, "phase_interval_within_photoperiod_extracted.csv", row.names = FALSE)
+cat("\nSaved (THIS is the plotted result): phase_interval_within_photoperiod_extracted.csv\n")
+
+summarize_result <- function(res) {
+  if (res$path == "parametric") {
+    tibble(variable = res$label, statistical_path = paste0("ANOVA (", res$scale_used, " scale, residuals normal)"),
+           shapiro_p_residuals = if (res$scale_used == "log") res$shapiro_log$p else res$shapiro_raw_p,
+           species_p = res$omnibus_table["species", "Pr(>F)"],
+           photoperiod_p = res$omnibus_table["photoperiod", "Pr(>F)"],
+           interaction_p = res$omnibus_table["species:photoperiod", "Pr(>F)"],
+           LD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "LD"],
+           SD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "SD"])
+  } else {
+    tab <- res$omnibus_table
+    tibble(variable = res$label, statistical_path = "ART (ARTool, Type III, residuals non-normal)",
+           shapiro_p_residuals = res$shapiro_raw_p,
+           species_p = tab$`Pr(>F)`[tab$Term == "species"],
+           photoperiod_p = tab$`Pr(>F)`[tab$Term == "photoperiod"],
+           interaction_p = tab$`Pr(>F)`[tab$Term == "species:photoperiod"],
+           LD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "LD"],
+           SD_pairwise_p = res$bracket_df$p_value[res$bracket_df$photoperiod == "SD"])
+  }
+}
+
+phase_interval_stats_summary <- bind_rows(
+  summarize_result(res_int), summarize_result(res_dev), summarize_result(res_e)
+)
+
+cat("\n====================================\n")
+cat("Interval/interval-deviation/E-peak-phase adaptive-statistics summary\n")
+cat("====================================\n")
+print(phase_interval_stats_summary)
+
+write.csv(phase_interval_stats_summary, "phase_interval_statistics_adaptive.csv", row.names = FALSE)
+
+# ============================================================
+# PLOT SETTINGS
+# Species colors, and italic species labels (plotmath italic()).
+# ============================================================
+species_colors <- c("Cxpip" = "#3B82B8", "Cxquin" = "#C65A1E")
+
+# Size of the bold significance labels (asterisks / "ns") on all
+# plots, in ggplot2 text-size units (size 5 is about 14 pt),
+# matching the activity box plots.
+SIG_LABEL_SIZE <- 5
+species_labels <- c(
+  "Cxpip"  = expression(italic("Cx. pipiens")),
+  "Cxquin" = expression(italic("Cx. quinquefasciatus"))
+)
+
+# ============================================================
+# E-TO-M INTERVAL PLOT
+# ============================================================
+bracket_int <- res_int$bracket_df %>% mutate(x_pos = 22)
+bracket_int_segments <- make_bracket_segments(bracket_int, x_col = "x_pos", tick = 0.5)
+
+p_interval <- ggplot(all_indiv, aes(y = species, x = EM_interval_mean, fill = species)) +
+  geom_boxplot(outlier.shape = NA, width = 0.55, alpha = 0.6, color = "black") +
+  geom_jitter(aes(color = species), height = 0.15, width = 0, size = 2, alpha = 0.7) +
+  geom_segment(data = bracket_int_segments,
+               aes(x = x, xend = xend, y = y, yend = yend), inherit.aes = FALSE, linewidth = 0.5) +
+  geom_text(data = bracket_int, aes(x = x_pos + 0.4, y = 1.5, label = label),
+            inherit.aes = FALSE, size = SIG_LABEL_SIZE, fontface = "bold", hjust = 0) +
+  facet_grid(photoperiod ~ ., switch = "y") +
+  scale_x_continuous(limits = c(0, 25), breaks = seq(0, 24, 4)) +
+  scale_y_discrete(limits = c("Cxquin", "Cxpip"), labels = species_labels) +
+  scale_fill_manual(values  = species_colors, drop = FALSE) +
+  scale_color_manual(values = species_colors, drop = FALSE) +
+  labs(x = "E-to-M interval (hours)", y = NULL,
+       title = "Within-individual E-to-M peak interval (single averaged 24h profile; manually verified)",
+       subtitle = res_int$subtitle) +
+  theme_classic() +
+  theme(legend.position = "none", strip.placement = "outside",
+        strip.background = element_rect(fill = "grey85", color = "grey40"),
+        strip.text.y.left = element_text(face = "bold", angle = 0), plot.subtitle = element_text(size = 8.5))
+
+p_interval
+ggsave("Fig_EM_interval_adaptive_SDvsLD_stacked_DD3.png", p_interval,
+       device = ragg::agg_png, width = 7, height = 6, dpi = 800)
+
+# ============================================================
+# E-TO-M INTERVAL DEVIATION PLOT
+# Dashed line: no deviation from the expected interval.
+# ============================================================
+bracket_dev <- res_dev$bracket_df %>% mutate(x_pos = 7)
+bracket_dev_segments <- make_bracket_segments(bracket_dev, x_col = "x_pos", tick = 0.4)
+
+p_interval_dev <- ggplot(all_indiv, aes(y = species, x = interval_deviation, fill = species)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.7, alpha = 0.7) +
+  geom_boxplot(outlier.shape = NA, width = 0.55, alpha = 0.6, color = "black") +
+  geom_jitter(aes(color = species), height = 0.15, width = 0, size = 2, alpha = 0.7) +
+  geom_segment(data = bracket_dev_segments,
+               aes(x = x, xend = xend, y = y, yend = yend), inherit.aes = FALSE, linewidth = 0.5) +
+  geom_text(data = bracket_dev, aes(x = x_pos + 0.4, y = 1.5, label = label),
+            inherit.aes = FALSE, size = SIG_LABEL_SIZE, fontface = "bold", hjust = 0) +
+  facet_grid(photoperiod ~ ., switch = "y") +
+  scale_x_continuous(limits = c(-10, 8), breaks = seq(-10, 8, 2)) +
+  scale_y_discrete(limits = c("Cxquin", "Cxpip"), labels = species_labels) +
+  scale_fill_manual(values  = species_colors, drop = FALSE) +
+  scale_color_manual(values = species_colors, drop = FALSE) +
+  labs(x = "E-to-M interval deviation from expected (hours)", y = NULL,
+       title = "Deviation of E-to-M interval from entrained dark-period length (manually verified)",
+       subtitle = res_dev$subtitle) +
+  theme_classic() +
+  theme(legend.position = "none", strip.placement = "outside",
+        strip.background = element_rect(fill = "grey85", color = "grey40"),
+        strip.text.y.left = element_text(face = "bold", angle = 0), plot.subtitle = element_text(size = 8.5))
+
+p_interval_dev
+ggsave("Fig_EM_interval_deviation_adaptive_SDvsLD_stacked_DD3.png", p_interval_dev,
+       device = ragg::agg_png, width = 7, height = 6, dpi = 800)
+
+# ============================================================
+# E-PEAK PHASE PLOT
+# E-peak time relative to the last lights-off (LLO) of entrainment;
+# values lie within +/- half_window_h (the search window). Brackets
+# are placed just beyond half_window_h so they do not overlap the
+# points.
+# ============================================================
+phase_axis_pad <- half_window_h * 0.8
+
+bracket_e <- res_e$bracket_df %>% mutate(x_pos = half_window_h + 0.4)
+bracket_e_segments <- make_bracket_segments(bracket_e, x_col = "x_pos", tick = half_window_h * 0.05)
+
+p_e_phase <- ggplot(all_indiv, aes(y = species, x = E_phase_h, fill = species)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.7, alpha = 0.7) +
+  geom_boxplot(outlier.shape = NA, width = 0.55, alpha = 0.6, color = "black") +
+  geom_jitter(aes(color = species), height = 0.15, width = 0, size = 2, alpha = 0.7) +
+  geom_segment(data = bracket_e_segments,
+               aes(x = x, xend = xend, y = y, yend = yend), inherit.aes = FALSE, linewidth = 0.5) +
+  geom_text(data = bracket_e, aes(x = x_pos + half_window_h * 0.1, y = 1.5, label = label),
+            inherit.aes = FALSE, size = SIG_LABEL_SIZE, fontface = "bold", hjust = 0) +
+  facet_grid(photoperiod ~ ., switch = "y") +
+  scale_x_continuous(limits = c(-half_window_h - phase_axis_pad, half_window_h + phase_axis_pad)) +
+  scale_y_discrete(limits = c("Cxquin", "Cxpip"), labels = species_labels) +
+  scale_fill_manual(values  = species_colors, drop = FALSE) +
+  scale_color_manual(values = species_colors, drop = FALSE) +
+  labs(x = "Deviation from LLO time (h)", y = NULL,
+       title = "Evening peak phase relative to last lights-off (manually verified)",
+       subtitle = res_e$subtitle) +
+  theme_classic() +
+  theme(legend.position = "none", strip.placement = "outside",
+        strip.background = element_rect(fill = "grey85", color = "grey40"),
+        strip.text.y.left = element_text(face = "bold", angle = 0), plot.subtitle = element_text(size = 8.5))
+
+p_e_phase
+ggsave("Fig_E_phase_adaptive_SDvsLD_stacked_DD3.png", p_e_phase,
+       device = ragg::agg_png, width = 7, height = 6, dpi = 800)
+
+# ============================================================
+# PEAK DETECTION RATE: OVERALL TEST (Fisher's exact test)
+# Detected vs. not-detected counts are compared across the four
+# species x photoperiod groups, separately for M- and E-peaks.
+# Fisher's exact test is used because detection is at or near 100%
+# in several groups; it is exact and valid with zero counts, whereas
+# a logistic regression model cannot be estimated reliably when
+# groups have complete separation. The test indicates whether the
+# four groups differ, not which factor is responsible; the pairwise
+# tests below identify which groups differ.
+# ============================================================
+detection_contingency <- function(df, has_peak_col) {
+  table(
+    group    = paste(df$species, df$photoperiod, sep = "_"),
+    detected = factor(df[[has_peak_col]], levels = c(TRUE, FALSE),
+                      labels = c("detected", "not_detected"))
+  )
+}
+
+safe_fisher <- function(tab) {
+  tryCatch(fisher.test(tab), error = function(e) {
+    warning("Fisher's test could not be computed (", conditionMessage(e),
+            ") -- most likely every individual in every group was detected.")
+    NULL
+  })
+}
+
+tab_M <- detection_contingency(all_indiv, "has_M_peak")
+tab_E <- detection_contingency(all_indiv, "has_E_peak")
+fisher_M <- safe_fisher(tab_M)
+fisher_E <- safe_fisher(tab_E)
+
+cat("\n====================================\n")
+cat("Fisher's exact test: does the peak DETECTION rate differ across the\n")
+cat("four species x photoperiod groups? -- M-peak\n")
+cat("====================================\n")
+print(tab_M)
+print(fisher_M)
+
+cat("\n====================================\n")
+cat("Fisher's exact test: does the peak DETECTION rate differ across the\n")
+cat("four species x photoperiod groups? -- E-peak\n")
+cat("(with detection failures in only 1 of 4 groups, this test has very\n")
+cat("little power -- interpret a non-significant result as 'not enough\n")
+cat("data to detect a difference', not as evidence of no difference)\n")
+cat("====================================\n")
+print(tab_E)
+print(fisher_E)
+
+peak_detection_fisher_summary <- tibble(
+  peak_type = c("M", "E"),
+  p_value   = c(if (is.null(fisher_M)) NA_real_ else fisher_M$p.value,
+                if (is.null(fisher_E)) NA_real_ else fisher_E$p.value)
+)
+write.csv(peak_detection_fisher_summary, "peak_detection_fisher_test.csv", row.names = FALSE)
+
+# ============================================================
+# PEAK DETECTION RATE: PAIRWISE FISHER'S TESTS
+# All six pairwise comparisons among the four groups, Holm-adjusted
+# across all six; the two within-photoperiod species comparisons are
+# then extracted (as for the continuous variables).
+# Odds ratio = odds of detection in group1 / odds in group2.
+# ============================================================
+pairwise_fisher_detection <- function(df, has_peak_col, label) {
+  d <- df %>%
+    mutate(group = paste(species, photoperiod, sep = "_")) %>%
+    select(group, has_peak = all_of(has_peak_col))
+
+  groups <- sort(unique(d$group))
+  pairs  <- combn(groups, 2, simplify = FALSE)
+
+  purrr::map_dfr(pairs, function(pr) {
+    sub <- d %>% filter(group %in% pr)
+    # Keep both detected/not-detected columns even when one is empty.
+    tab <- table(factor(sub$group, levels = pr),
+                 factor(sub$has_peak, levels = c(TRUE, FALSE)))
+    ft  <- fisher.test(tab)
+    tibble(
+      comparison = label,
+      group1 = pr[1], group2 = pr[2],
+      pct_detected_group1 = round(100 * mean(sub$has_peak[sub$group == pr[1]]), 1),
+      pct_detected_group2 = round(100 * mean(sub$has_peak[sub$group == pr[2]]), 1),
+      odds_ratio_detection = unname(ft$estimate),
+      ci_lower = ft$conf.int[1], ci_upper = ft$conf.int[2],
+      p_value = ft$p.value
+    )
+  }) %>%
+    mutate(p_holm6 = p.adjust(p_value, method = "holm"),
+           significance = sig_stars(p_holm6))
+}
+
+fisher_pairwise_M <- pairwise_fisher_detection(all_indiv, "has_M_peak", "M_detection")
+fisher_pairwise_E <- pairwise_fisher_detection(all_indiv, "has_E_peak", "E_detection")
+
+cat("\n====================================\n")
+cat("Full 6-way pairwise Fisher's tests on detection rate (Holm-corrected across all 6) -- M-peak\n")
+cat("====================================\n")
+print(fisher_pairwise_M)
+
+cat("\n====================================\n")
+cat("Full 6-way pairwise Fisher's tests on detection rate (Holm-corrected across all 6) -- E-peak\n")
+cat("(most cells are at 100% detection, so interpret with the same\n")
+cat("low-power caveat as the omnibus E-peak test above)\n")
+cat("====================================\n")
+print(fisher_pairwise_E)
+
+peak_detection_pairwise_full6 <- bind_rows(fisher_pairwise_M, fisher_pairwise_E)
+write.csv(peak_detection_pairwise_full6, "peak_detection_pairwise_full6_global.csv", row.names = FALSE)
+
+peak_detection_within_photoperiod <- bind_rows(
+  extract_within_photoperiod(fisher_pairwise_M, "M_detection"),
+  extract_within_photoperiod(fisher_pairwise_E, "E_detection")
+)
+
+cat("\n====================================\n")
+cat("Within-photoperiod comparisons (Cxpip vs Cxquin) extracted from the\n")
+cat("globally-corrected 6-way family -- species effect on peak detection\n")
+cat("rate, within each photoperiod (THIS is the planned comparison to report)\n")
+cat("====================================\n")
+print(peak_detection_within_photoperiod)
+
+write.csv(peak_detection_within_photoperiod, "peak_detection_within_photoperiod_extracted.csv", row.names = FALSE)
+
+# ============================================================
+# PEAK DETECTION RATE PLOT
+# M- and E-peak detection rates (after manual verification; manually
+# excluded peaks count as not detected) per species, one panel per
+# photoperiod, with 95% Wilson confidence intervals. Brackets show
+# the within-photoperiod species comparisons (pairwise Fisher's
+# tests, Holm-adjusted).
+# ============================================================
+# ---- 95% Wilson score confidence interval for a proportion. Unlike
+#      a standard-error interval, it stays within 0-1 and has non-zero
+#      width when all individuals in a group were detected. ----
+wilson_ci <- function(x, n, conf = 0.95) {
+  z      <- qnorm(1 - (1 - conf) / 2)
+  p      <- x / n
+  denom  <- 1 + z^2 / n
+  center <- (p + z^2 / (2 * n)) / denom
+  half   <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / denom
+  c(lower = max(0, center - half), upper = min(1, center + half))
+}
+
+peak_detect_long <- peak_detection_summary %>%
+  select(species, photoperiod, n_total, n_M_detected, n_E_detected) %>%
+  pivot_longer(cols = c(n_M_detected, n_E_detected),
+               names_to = "peak_type", values_to = "n_detected") %>%
+  mutate(
+    peak_type    = if_else(peak_type == "n_M_detected", "M", "E"),
+    pct_detected = 100 * n_detected / n_total,
+    ci           = purrr::map2(n_detected, n_total, wilson_ci),
+    ci_lower     = 100 * purrr::map_dbl(ci, "lower"),
+    ci_upper     = 100 * purrr::map_dbl(ci, "upper"),
+    photoperiod  = factor(photoperiod, levels = c("LD", "SD"))
+  ) %>%
+  select(-ci)
+
+cat("\n====================================\n")
+cat("Peak detection rate with 95% Wilson score confidence intervals\n")
+cat("====================================\n")
+print(peak_detect_long %>% mutate(across(c(pct_detected, ci_lower, ci_upper), ~ round(.x, 1))))
+
+write.csv(peak_detect_long %>% mutate(across(c(pct_detected, ci_lower, ci_upper), ~ round(.x, 2))),
+          "peak_detection_rate_wilson_CI.csv", row.names = FALSE)
+
+# Horizontal offset of the E and M bars from each species' center
+# (position_dodge(width = 0.7) with two bars).
+dodge_offset <- 0.7 / 4
+
+# Bracket spacing, based on the highest bar across both panels so
+# spacing is the same in each panel.
+global_max <- max(peak_detect_long$pct_detected, na.rm = TRUE)
+gap_unit   <- global_max * 0.10
+tick_len   <- global_max * 0.025
+label_pad  <- global_max * 0.04
+
+bracket_detect <- peak_detection_within_photoperiod %>%
+  mutate(
+    peak_type   = str_remove(comparison, "_detection"),
+    photoperiod = factor(photoperiod, levels = c("LD", "SD")),
+    x_g1  = if_else(str_detect(group1, "Cxpip"), 1, 2),
+    x_g2  = if_else(str_detect(group2, "Cxpip"), 1, 2),
+    dodge = if_else(peak_type == "E", -dodge_offset, dodge_offset),
+    x1    = x_g1 + dodge,
+    x2    = x_g2 + dodge
+  )
+
+# Height of the taller of the two bars each bracket connects, using
+# the upper confidence limit so brackets clear the error bars.
+bar_heights <- peak_detect_long %>%
+  select(species, photoperiod, peak_type, pct_detected = ci_upper)
+
+bracket_detect <- bracket_detect %>%
+  rowwise() %>%
+  mutate(
+    bar_max_local = max(
+      bar_heights$pct_detected[bar_heights$photoperiod == photoperiod &
+                                 bar_heights$peak_type == peak_type],
+      na.rm = TRUE
+    )
+  ) %>%
+  ungroup()
+
+# Stack the brackets in each panel: E bracket below, M bracket above,
+# each gap_unit above the taller of its own bars or the previous
+# bracket.
+stack_brackets <- function(df) {
+  df <- df %>% arrange(factor(peak_type, levels = c("E", "M")))
+  running_max <- 0
+  y_pos <- numeric(nrow(df))
+  for (i in seq_len(nrow(df))) {
+    running_max <- max(running_max, df$bar_max_local[i]) + gap_unit
+    y_pos[i] <- running_max
+  }
+  df$y_pos <- y_pos
+  df
+}
+
+bracket_detect <- bracket_detect %>%
+  group_by(photoperiod) %>%
+  group_modify(~ stack_brackets(.x)) %>%
+  ungroup() %>%
+  mutate(tick = tick_len)
+
+bracket_detect_segments <- bind_rows(
+  bracket_detect %>% transmute(photoperiod, x = x1, xend = x2, y = y_pos, yend = y_pos),
+  bracket_detect %>% transmute(photoperiod, x = x1, xend = x1, y = y_pos, yend = y_pos - tick),
+  bracket_detect %>% transmute(photoperiod, x = x2, xend = x2, y = y_pos, yend = y_pos - tick)
+)
+
+y_axis_top <- max(c(peak_detect_long$pct_detected, bracket_detect$y_pos), na.rm = TRUE) + gap_unit * 1.5
+
+# Bracket labels ("ns" and asterisks), bold at SIG_LABEL_SIZE, drawn
+# with vjust = 0 just above the bracket line.
+bracket_detect_ns    <- bracket_detect %>% filter(!str_detect(significance, "\\*"))
+bracket_detect_stars <- bracket_detect %>% filter(str_detect(significance, "\\*"))
+
+p_detect <- ggplot(peak_detect_long, aes(x = species, y = pct_detected, fill = peak_type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "black") +
+  # 95% Wilson CI error bars (grey on the black M bars for contrast).
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper, colour = peak_type),
+                position = position_dodge(width = 0.7), width = 0.2, linewidth = 0.6) +
+  scale_colour_manual(values = c(M = "grey60", E = "black"), guide = "none") +
+  geom_segment(data = bracket_detect_segments,
+               aes(x = x, xend = xend, y = y, yend = yend), inherit.aes = FALSE, linewidth = 0.5) +
+  geom_text(data = bracket_detect_ns,
+            aes(x = (x1 + x2) / 2, y = y_pos + label_pad * 0.15, label = significance),
+            inherit.aes = FALSE, size = SIG_LABEL_SIZE, fontface = "bold", vjust = 0) +
+  geom_text(data = bracket_detect_stars,
+            aes(x = (x1 + x2) / 2, y = y_pos + label_pad * 0.15, label = significance),
+            inherit.aes = FALSE, size = SIG_LABEL_SIZE, fontface = "bold", vjust = 0) +
+  facet_grid(. ~ photoperiod, switch = "x") +
+  scale_y_continuous(limits = c(0, y_axis_top), breaks = seq(0, 100, 25), expand = c(0, 0)) +
+  scale_x_discrete(limits = c("Cxpip", "Cxquin"), labels = species_labels) +
+  scale_fill_manual(values = c(M = "black", E = "white"),
+                    labels = c(M = "Mpeak", E = "Epeak"),
+                    name = NULL) +
+  # End the y-axis line at 100%; the space above holds the brackets
+  # (guide_axis(cap = ...) requires ggplot2 >= 3.5.0).
+  guides(y = guide_axis(cap = "upper")) +
+  labs(x = NULL, y = "Peak detection rate (%)",
+       title = "Peak detection rate, by group and peak type",
+       subtitle = "After manual verification layer; error bars = 95% Wilson CI\nBrackets: within-photoperiod species comparisons (Fisher's exact, Holm-corrected)") +
+  theme_classic() +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "grey85", color = "grey40"),
+        strip.text.x = element_text(face = "bold"),
+        # Center the y-axis title on the 0-100% axis line.
+        axis.title.y = element_text(hjust = 50 / y_axis_top))
+
+p_detect
+ggsave("Fig_peak_detection_rate_SDvsLD.png", p_detect,
+       device = ragg::agg_png, width = 7, height = 6, dpi = 800)
+```
+
+
+
+

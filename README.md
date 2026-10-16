@@ -115,8 +115,6 @@ Analyses were run in R 4.3.1. Packages used:
 
 Periodograms were computed in Rtivity (Silva et al. 2022) and imported as Excel exports. PDF immunohistochemistry (Fig. 6) was quantified in FIJI/ImageJ.
 
-Record the package versions you used with `sessionInfo()`.
-
 ## Key references for the methods
 
 - Vaze KM et al. (2023). *J Comp Physiol A*: peak detection method adapted here.
